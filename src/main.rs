@@ -42,10 +42,62 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let api_key = env::var("OPENROUTER_ASK_API_KEY")
         .map_err(|_| "Please set the OPENROUTER_ASK_API_KEY environment variable.")?;
 
-    let full_prompt = PROMPT_TEMPLATE.replace("{query}", &args.prompt);
+    match args.prompt {
+        Some(prompt) => {
+            // Single prompt mode
+            process_prompt(&prompt, &args.model, &api_key, &theme)?;
+        }
+        None => {
+            // Interactive mode
+            run_interactive_mode(&args.model, &api_key, &theme)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn run_interactive_mode(model: &str, api_key: &str, theme: &Theme) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", theme.prompt_text("Interactive mode. Type 'exit' or 'quit' to exit."));
+    println!();
+
+    loop {
+        print!("{} ", theme.prompt_text("ask>"));
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        let input = input.trim();
+
+        if input.is_empty() {
+            continue;
+        }
+
+        if input == "exit" || input == "quit" {
+            println!("Goodbye!");
+            break;
+        }
+
+        if let Err(err) = process_prompt(input, model, api_key, theme) {
+            eprintln!("Error: {}", err);
+            // Continue the loop even on error in interactive mode
+        }
+
+        println!(); // Add blank line between prompts
+    }
+
+    Ok(())
+}
+
+fn process_prompt(
+    prompt: &str,
+    model: &str,
+    api_key: &str,
+    theme: &Theme,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let full_prompt = PROMPT_TEMPLATE.replace("{query}", prompt);
 
     let body = serde_json::json!({
-        "model": args.model,
+        "model": model,
         "messages": [
             {
                 "role": "user",
@@ -136,8 +188,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 fn confirm(command: &str, theme: &Theme) -> Result<ConfirmResponse, io::Error> {
     print!(
-        "{}  {}?  [Y/n/s/i]  ",
-        theme.prompt_text("Run command:"),
+        "{} {}?  [Y/n/s/i]  ",
+        theme.prompt_text("run>"),
         theme.command_text(command)
     );
     io::stdout().flush()?;
@@ -156,7 +208,7 @@ fn confirm(command: &str, theme: &Theme) -> Result<ConfirmResponse, io::Error> {
         "s" | "skip" => Ok(ConfirmResponse::Skip),
         "i" | "instruct" => {
             // Get custom command from user
-            print!("{}  ", theme.prompt_text("Enter command:"));
+            print!("{} ", theme.prompt_text("enter>"));
             io::stdout().flush()?;
             let mut custom_command = String::new();
             io::stdin().read_line(&mut custom_command)?;
@@ -190,7 +242,7 @@ fn parse_commands(content: &str) -> Vec<String> {
 }
 
 struct Args {
-    prompt: String,
+    prompt: Option<String>,  // None indicates interactive mode
     model: String,
     theme: ThemeMode,
 }
@@ -233,9 +285,12 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         }
     }
 
-    if prompt_parts.is_empty() {
-        return Err("Usage: ask [--model MODEL] [--theme light|dark] <prompt>".into());
-    }
+    // If no prompt provided, enter interactive mode
+    let prompt = if prompt_parts.is_empty() {
+        None
+    } else {
+        Some(prompt_parts.join(" "))
+    };
 
     if save_theme {
         config.theme = theme;
@@ -245,7 +300,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     }
 
     Ok(Args {
-        prompt: prompt_parts.join(" "),
+        prompt,
         model,
         theme,
     })
@@ -256,7 +311,12 @@ fn print_help() {
         "ask - MacOS command assistant
 
 Usage:
-  ask [--model MODEL] [--theme light|dark] <prompt>
+  ask [--model MODEL] [--theme light|dark] <prompt>   # Single prompt mode
+  ask [--model MODEL] [--theme light|dark]             # Interactive mode
+
+Modes:
+  Single prompt:    Provide a prompt and get commands to execute
+  Interactive:      Enter multiple prompts in a session (type 'exit' or 'quit' to end)
 
 Options:
   --model MODEL     Override the default LLM model ({DEFAULT_MODEL})
@@ -274,9 +334,12 @@ and asks for confirmation before executing each one in your shell.
 
 Command confirmation options:
   Y/yes (or Enter)  Execute the command
-  n/no              Cancel execution and exit
+  n/no              Cancel execution and exit (in interactive mode, returns to prompt)
   s/skip            Skip this command and continue to the next
-  i/instruct        Execute a custom command first, then return to the original"
+  i/instruct        Execute a custom command first, then return to the original
+
+Interactive mode commands:
+  exit / quit       Exit interactive mode"
     );
 }
 
