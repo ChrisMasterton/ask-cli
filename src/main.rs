@@ -90,20 +90,53 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        if !confirm(&command, &theme)? {
-            println!("Command execution cancelled");
-            return Ok(());
+        match confirm(&command, &theme)? {
+            ConfirmResponse::Yes => {
+                run_command(&command)?;
+            }
+            ConfirmResponse::No => {
+                println!("Command execution cancelled");
+                return Ok(());
+            }
+            ConfirmResponse::Skip => {
+                println!("Skipping command: {}", theme.command_text(&command));
+                continue;
+            }
+            ConfirmResponse::Instruct(custom_command) => {
+                if !custom_command.is_empty() {
+                    println!("Running custom command: {}", theme.command_text(&custom_command));
+                    run_command(&custom_command)?;
+                }
+                // After running custom command, continue with the original flow
+                println!("\nReturning to original command:");
+                match confirm(&command, &theme)? {
+                    ConfirmResponse::Yes => {
+                        run_command(&command)?;
+                    }
+                    ConfirmResponse::No => {
+                        println!("Command execution cancelled");
+                        return Ok(());
+                    }
+                    ConfirmResponse::Skip => {
+                        println!("Skipping command: {}", theme.command_text(&command));
+                        continue;
+                    }
+                    ConfirmResponse::Instruct(_) => {
+                        // Don't allow nested instruct for simplicity
+                        println!("Nested instruct not allowed. Skipping command.");
+                        continue;
+                    }
+                }
+            }
         }
-
-        run_command(&command)?;
     }
 
     Ok(())
 }
 
-fn confirm(command: &str, theme: &Theme) -> Result<bool, io::Error> {
+fn confirm(command: &str, theme: &Theme) -> Result<ConfirmResponse, io::Error> {
     print!(
-        "{}  {}?  [Y/n]  ",
+        "{}  {}?  [Y/n/s/i]  ",
         theme.prompt_text("Run command:"),
         theme.command_text(command)
     );
@@ -112,11 +145,28 @@ fn confirm(command: &str, theme: &Theme) -> Result<bool, io::Error> {
     io::stdin().read_line(&mut input)?;
 
     if input.contains('\u{1b}') {
-        return Ok(false);
+        return Ok(ConfirmResponse::No);
     }
 
     let trimmed = input.trim().to_lowercase();
-    Ok(trimmed.is_empty() || trimmed == "y" || trimmed == "yes")
+
+    match trimmed.as_str() {
+        "" | "y" | "yes" => Ok(ConfirmResponse::Yes),
+        "n" | "no" => Ok(ConfirmResponse::No),
+        "s" | "skip" => Ok(ConfirmResponse::Skip),
+        "i" | "instruct" => {
+            // Get custom command from user
+            print!("{}  ", theme.prompt_text("Enter command:"));
+            io::stdout().flush()?;
+            let mut custom_command = String::new();
+            io::stdin().read_line(&mut custom_command)?;
+            Ok(ConfirmResponse::Instruct(custom_command.trim().to_string()))
+        }
+        _ => {
+            println!("Invalid response. Please use Y(es), n(o), s(kip), or i(nstruct).");
+            confirm(command, theme)
+        }
+    }
 }
 
 fn run_command(command: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -220,7 +270,13 @@ Config:
   Default theme preference is stored in ~/.ask/config (theme=light|dark).
 
 The tool sends your prompt to OpenRouter, previews the generated commands,
-and asks for confirmation before executing each one in your shell."
+and asks for confirmation before executing each one in your shell.
+
+Command confirmation options:
+  Y/yes (or Enter)  Execute the command
+  n/no              Cancel execution and exit
+  s/skip            Skip this command and continue to the next
+  i/instruct        Execute a custom command first, then return to the original"
     );
 }
 
@@ -237,6 +293,13 @@ struct Choice {
 #[derive(Debug, Deserialize)]
 struct Message {
     content: String,
+}
+
+enum ConfirmResponse {
+    Yes,
+    No,
+    Skip,
+    Instruct(String),
 }
 
 #[derive(Clone, Copy)]

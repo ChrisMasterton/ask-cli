@@ -1,0 +1,3 @@
+echo "First command"
+echo "Second command"
+echo "Third command"
