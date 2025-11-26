@@ -1,3 +1,5 @@
+use rustyline::error::ReadlineError;
+use rustyline::DefaultEditor;
 use serde::Deserialize;
 use serde_json::json;
 use std::env;
@@ -73,8 +75,45 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+// Check if the input looks like a script file to run
+fn is_script_execution(cmd: &str) -> bool {
+    let cmd = cmd.trim();
+
+    // Check for explicit script interpreters
+    if cmd.starts_with("python ") || cmd.starts_with("python3 ") ||
+       cmd.starts_with("node ") || cmd.starts_with("ruby ") ||
+       cmd.starts_with("perl ") || cmd.starts_with("php ") ||
+       cmd.starts_with("bash ") || cmd.starts_with("sh ") ||
+       cmd.starts_with("zsh ") || cmd.starts_with("./") {
+        return true;
+    }
+
+    // Check if it's a script file by extension
+    if let Some(extension) = cmd.split('.').last() {
+        matches!(extension,
+            "sh" | "bash" | "zsh" |
+            "py" | "python" |
+            "js" | "mjs" | "ts" |
+            "rb" | "ruby" |
+            "pl" | "perl" |
+            "php" |
+            "r" | "R" |
+            "go" | "rs" |
+            "java" | "class" |
+            "swift" | "kt"
+        )
+    } else {
+        false
+    }
+}
+
 // Safe commands that can be executed directly without LLM confirmation
 fn is_safe_direct_command(cmd: &str) -> bool {
+    // Check if it's a script first
+    if is_script_execution(cmd) {
+        return true;
+    }
+
     let safe_commands = [
         // File listing and navigation
         "ls", "ll", "la", "dir", "pwd", "tree",
@@ -117,7 +156,7 @@ fn is_safe_direct_command(cmd: &str) -> bool {
 
 fn run_interactive_mode(model: &str, api_key: &str, theme: &Theme) -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", theme.prompt_text("Interactive mode. Commands: 'exit', 'clear', 'finder'"));
-    println!("{}", theme.helper_text("Common commands (ls, pwd, cat, etc.) execute directly without confirmation"));
+    println!("{}", theme.helper_text("Common commands and scripts execute directly without confirmation"));
     println!("{}", theme.helper_text("Shortcuts: q=quit, .=pwd, ..=cd .."));
 
     // Show current directory on start
@@ -126,6 +165,7 @@ fn run_interactive_mode(model: &str, api_key: &str, theme: &Theme) -> Result<(),
     }
     println!();
 
+    let mut rl = DefaultEditor::new()?;
     let mut history: Vec<ConversationContext> = Vec::new();
 
     loop {
@@ -150,16 +190,31 @@ fn run_interactive_mode(model: &str, api_key: &str, theme: &Theme) -> Result<(),
             "?".to_string()
         };
 
-        print!("{} ", theme.prompt_text(&format!("ask [{}]>", cwd_display)));
-        io::stdout().flush()?;
-
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
+        let prompt = format!("{} ", theme.prompt_text(&format!("ask [{}]>", cwd_display)));
+        let input = match rl.readline(&prompt) {
+            Ok(line) => line,
+            Err(ReadlineError::Interrupted) => {
+                // Ctrl-C: cancel current line, continue loop
+                println!("^C");
+                continue;
+            }
+            Err(ReadlineError::Eof) => {
+                // Ctrl-D: exit
+                println!("Goodbye!");
+                break;
+            }
+            Err(err) => {
+                return Err(err.into());
+            }
+        };
         let input = input.trim();
 
         if input.is_empty() {
             continue;
         }
+
+        // Add to readline history for arrow-key navigation
+        let _ = rl.add_history_entry(input);
 
         // Shortcuts for common commands
         if input == "q" || input == "exit" || input == "quit" {
@@ -213,7 +268,7 @@ fn run_interactive_mode(model: &str, api_key: &str, theme: &Theme) -> Result<(),
             Command::new("clear").status()?;
             history.clear();
             println!("{}", theme.prompt_text("Interactive mode. Commands: 'exit', 'clear', 'finder'"));
-            println!("{}", theme.helper_text("Common commands (ls, pwd, cat, etc.) execute directly without confirmation"));
+            println!("{}", theme.helper_text("Common commands and scripts execute directly without confirmation"));
             println!("{}", theme.helper_text("Shortcuts: q=quit, .=pwd, ..=cd .."));
 
             // Show current directory after clear
@@ -235,14 +290,33 @@ fn run_interactive_mode(model: &str, api_key: &str, theme: &Theme) -> Result<(),
 
         // Check if it's a safe direct command
         if is_safe_direct_command(input) {
-            // Special handling for plain 'ls' - convert to 'ls -l' for better info
+            // Determine the actual command to run
             let command_to_run = if input.trim() == "ls" {
-                "ls -l"
+                // Special handling for plain 'ls' - convert to 'ls -l' for better info
+                "ls -l".to_string()
+            } else if is_script_execution(input) && !input.contains(" ") {
+                // If it's just a script name without interpreter, add appropriate interpreter
+                let script = input.trim();
+                if script.ends_with(".py") {
+                    format!("python3 {}", script)
+                } else if script.ends_with(".js") || script.ends_with(".mjs") {
+                    format!("node {}", script)
+                } else if script.ends_with(".rb") {
+                    format!("ruby {}", script)
+                } else if script.ends_with(".sh") || script.ends_with(".bash") {
+                    format!("bash {}", script)
+                } else if script.ends_with(".pl") {
+                    format!("perl {}", script)
+                } else if script.ends_with(".php") {
+                    format!("php {}", script)
+                } else {
+                    input.to_string()
+                }
             } else {
-                input
+                input.to_string()
             };
 
-            println!("{} {}", theme.prompt_text("run>"), theme.command_text(command_to_run));
+            println!("{} {}", theme.prompt_text("run>"), theme.command_text(&command_to_run));
 
             // Special handling for cd command
             if input.trim().starts_with("cd") {
@@ -271,13 +345,13 @@ fn run_interactive_mode(model: &str, api_key: &str, theme: &Theme) -> Result<(),
                     }
                 }
             } else {
-                // Execute other safe commands
-                match run_command_with_output(command_to_run) {
+                // Execute other safe commands (including scripts)
+                match run_command_with_output(&command_to_run) {
                     Ok(output) => {
                         // Add to history - store what was actually executed
                         history.push(ConversationContext {
                             prompt: input.to_string(),
-                            commands: vec![command_to_run.to_string()],
+                            commands: vec![command_to_run.clone()],
                             outputs: vec![output],
                         });
                     }
@@ -791,7 +865,7 @@ impl Theme {
             ThemeMode::Dark => Self {
                 helper_color: "\u{001b}[36;1m",
                 command_color: "\u{001b}[93m",
-                prompt_color: "\u{001b}[97m",
+                prompt_color: "\u{001b}[92m", // bright green - distinct from regular text
             },
         }
     }
