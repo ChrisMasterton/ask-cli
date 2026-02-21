@@ -4,7 +4,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::env;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::process::{Command, exit};
 
@@ -616,38 +616,87 @@ fn process_prompt_with_context(
 }
 
 fn confirm(command: &str, theme: &Theme) -> Result<ConfirmResponse, io::Error> {
-    print!(
-        "{} {}?  [Y/n/s/i]  ",
-        theme.prompt_text("run>"),
-        theme.command_text(command)
-    );
-    io::stdout().flush()?;
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
+    loop {
+        print!(
+            "{} {}?  [Y/n/s/i]  ",
+            theme.prompt_text("run>"),
+            theme.command_text(command)
+        );
+        io::stdout().flush()?;
 
-    if input.contains('\u{1b}') {
-        return Ok(ConfirmResponse::No);
+        let input = read_confirmation_line()?;
+
+        match parse_confirmation_choice(&input) {
+            Some(ConfirmChoice::Yes) => return Ok(ConfirmResponse::Yes),
+            Some(ConfirmChoice::No) => return Ok(ConfirmResponse::No),
+            Some(ConfirmChoice::Skip) => return Ok(ConfirmResponse::Skip),
+            Some(ConfirmChoice::Instruct) => {
+                print!("{} ", theme.prompt_text("enter>"));
+                io::stdout().flush()?;
+                let custom_command = read_confirmation_line()?;
+                return Ok(ConfirmResponse::Instruct(custom_command.trim().to_string()));
+            }
+            None => {
+                println!("Invalid response. Please use Y(es), n(o), s(kip), or i(nstruct).");
+            }
+        }
     }
+}
 
-    let trimmed = input.trim().to_lowercase();
+fn parse_confirmation_choice(input: &str) -> Option<ConfirmChoice> {
+    let trimmed = normalize_confirmation_input(input);
 
     match trimmed.as_str() {
-        "" | "y" | "yes" => Ok(ConfirmResponse::Yes),
-        "n" | "no" => Ok(ConfirmResponse::No),
-        "s" | "skip" => Ok(ConfirmResponse::Skip),
-        "i" | "instruct" => {
-            // Get custom command from user
-            print!("{} ", theme.prompt_text("enter>"));
-            io::stdout().flush()?;
-            let mut custom_command = String::new();
-            io::stdin().read_line(&mut custom_command)?;
-            Ok(ConfirmResponse::Instruct(custom_command.trim().to_string()))
+        "" | "y" | "yes" => Some(ConfirmChoice::Yes),
+        "n" | "no" => Some(ConfirmChoice::No),
+        "s" | "skip" => Some(ConfirmChoice::Skip),
+        "i" | "instruct" => Some(ConfirmChoice::Instruct),
+        _ => None,
+    }
+}
+
+fn read_confirmation_line() -> Result<String, io::Error> {
+    let mut input = String::new();
+
+    // Prefer reading from controlling TTY so confirmations still work
+    // when stdin is redirected or line editing is active.
+    match fs::OpenOptions::new().read(true).open("/dev/tty") {
+        Ok(tty) => {
+            let mut reader = io::BufReader::new(tty);
+            reader.read_line(&mut input)?;
         }
-        _ => {
-            println!("Invalid response. Please use Y(es), n(o), s(kip), or i(nstruct).");
-            confirm(command, theme)
+        Err(_) => {
+            io::stdin().read_line(&mut input)?;
         }
     }
+
+    Ok(input)
+}
+
+fn normalize_confirmation_input(input: &str) -> String {
+    let mut cleaned = String::new();
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            // Strip ANSI escape sequences that can leak into terminal input.
+            if matches!(chars.peek(), Some('[')) {
+                chars.next();
+                for seq_char in chars.by_ref() {
+                    if ('@'..='~').contains(&seq_char) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+
+        if !ch.is_control() {
+            cleaned.push(ch);
+        }
+    }
+
+    cleaned.trim().to_lowercase()
 }
 
 fn run_command_with_output(command: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -816,6 +865,14 @@ enum ConfirmResponse {
     Instruct(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfirmChoice {
+    Yes,
+    No,
+    Skip,
+    Instruct,
+}
+
 #[derive(Clone)]
 struct ConversationContext {
     prompt: String,
@@ -933,4 +990,34 @@ impl Config {
 
 fn config_path() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".ask").join("config"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConfirmChoice, normalize_confirmation_input, parse_confirmation_choice};
+
+    #[test]
+    fn normalize_confirmation_input_strips_ansi_sequences() {
+        let input = "\u{1b}[?2004lyes\u{1b}[?2004h\n";
+        assert_eq!(normalize_confirmation_input(input), "yes");
+    }
+
+    #[test]
+    fn normalize_confirmation_input_keeps_valid_option() {
+        assert_eq!(normalize_confirmation_input("  s  \r\n"), "s");
+    }
+
+    #[test]
+    fn parse_confirmation_choice_treats_escaped_yes_as_yes() {
+        let input = "\u{1b}[?2004ly\u{1b}[?2004h\n";
+        assert_eq!(parse_confirmation_choice(input), Some(ConfirmChoice::Yes));
+    }
+
+    #[test]
+    fn parse_confirmation_choice_supports_all_options() {
+        assert_eq!(parse_confirmation_choice("n"), Some(ConfirmChoice::No));
+        assert_eq!(parse_confirmation_choice("skip"), Some(ConfirmChoice::Skip));
+        assert_eq!(parse_confirmation_choice("i"), Some(ConfirmChoice::Instruct));
+        assert_eq!(parse_confirmation_choice("maybe"), None);
+    }
 }
