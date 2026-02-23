@@ -4,7 +4,8 @@ use serde::Deserialize;
 use serde_json::json;
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read as _, Write};
+use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::process::{Command, exit};
 
@@ -13,6 +14,7 @@ const DEFAULT_MODEL: &str = "meta-llama/llama-3.3-70b-instruct";
 // Token limits - most models support 4K-128K, we'll be conservative
 const MAX_CONTEXT_TOKENS: usize = 3000;  // Reserve ~1000 for response
 const TOKEN_ESTIMATE_RATIO: usize = 4;   // Roughly 1 token per 4 characters
+const MAX_PIPE_BYTES: usize = 64 * 1024; // 64 KB max piped input to keep context reasonable
 const PROMPT_TEMPLATE: &str = r#"
 You are a command-line assistant specialized in MacOS Zsh scripting, helping users both with commands and general assistance.
 
@@ -47,6 +49,28 @@ Response:
 **User request:** {query}
 "#;
 
+const PIPE_PROMPT_TEMPLATE: &str = r#"
+You are a command-line assistant specialized in MacOS Zsh scripting and data analysis.
+
+The user has piped the following data to you via stdin:
+
+---BEGIN PIPED DATA---
+{piped_data}
+---END PIPED DATA---
+
+**Instructions:**
+- The user's request relates to the piped data above
+- If the user asks you to analyze, summarize, filter, transform, or explain the data, respond conversationally (prefix lines with `# `)
+- If the user asks you to generate a command that processes data like this, return the command
+- If no specific request is given, provide a brief, useful summary of the data (prefix with `# `)
+- Use **safe practices** (avoid dangerous commands like `rm -rf /`)
+- Assume the user is using **MacOS** **Zsh** unless they specify otherwise
+- Do not use any code blocks (```) in your response
+- Be concise and directly useful
+
+**User request:** {query}
+"#;
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("Error: {err}");
@@ -54,7 +78,37 @@ fn main() {
     }
 }
 
+/// Returns true when stdin is connected to a pipe (not a terminal).
+fn stdin_is_piped() -> bool {
+    unsafe { libc_isatty(io::stdin().as_raw_fd()) == 0 }
+}
+
+// Minimal FFI – avoids pulling in the libc crate just for isatty.
+unsafe extern "C" {
+    #[link_name = "isatty"]
+    fn libc_isatty(fd: i32) -> i32;
+}
+
+/// Reads up to `MAX_PIPE_BYTES` from stdin, returning `None` when stdin is a
+/// terminal or the pipe is empty.
+fn read_piped_stdin() -> Option<String> {
+    if !stdin_is_piped() {
+        return None;
+    }
+    let mut buf = Vec::with_capacity(8192);
+    let mut handle = io::stdin().lock();
+    let _ = handle.by_ref().take(MAX_PIPE_BYTES as u64).read_to_end(&mut buf);
+    if buf.is_empty() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&buf).to_string();
+    Some(text)
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // Read piped data BEFORE anything else touches stdin.
+    let piped_data = read_piped_stdin();
+
     let args = parse_args()?;
     let theme = Theme::from_mode(args.theme);
 
@@ -63,11 +117,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     match args.prompt {
         Some(prompt) => {
-            // Single prompt mode
-            process_prompt(&prompt, &args.model, &api_key, &theme)?;
+            // Single prompt mode (with optional piped data)
+            process_prompt(&prompt, &args.model, &api_key, &theme, piped_data.as_deref())?;
+        }
+        None if piped_data.is_some() => {
+            // Data piped in but no prompt – summarize / analyse by default
+            process_prompt(
+                "Summarize and explain this data",
+                &args.model,
+                &api_key,
+                &theme,
+                piped_data.as_deref(),
+            )?;
         }
         None => {
-            // Interactive mode
+            // Interactive mode (no pipe)
             run_interactive_mode(&args.model, &api_key, &theme)?;
         }
     }
@@ -373,7 +437,7 @@ fn run_interactive_mode(model: &str, api_key: &str, theme: &Theme) -> Result<(),
             continue;
         }
 
-        match process_prompt_with_context(input, model, api_key, theme, &history) {
+        match process_prompt_with_context(input, model, api_key, theme, &history, None) {
             Ok((commands, outputs)) => {
                 // Add to history
                 history.push(ConversationContext {
@@ -408,8 +472,9 @@ fn process_prompt(
     model: &str,
     api_key: &str,
     theme: &Theme,
+    piped_data: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    process_prompt_with_context(prompt, model, api_key, theme, &[])?;
+    process_prompt_with_context(prompt, model, api_key, theme, &[], piped_data)?;
     Ok(())
 }
 
@@ -487,6 +552,7 @@ fn process_prompt_with_context(
     api_key: &str,
     theme: &Theme,
     history: &[ConversationContext],
+    piped_data: Option<&str>,
 ) -> Result<(Vec<String>, Vec<String>), Box<dyn std::error::Error>> {
     let mut messages = Vec::new();
 
@@ -500,8 +566,21 @@ fn process_prompt_with_context(
         }));
     }
 
-    // Add the main prompt
-    let full_prompt = PROMPT_TEMPLATE.replace("{query}", prompt);
+    // Build the user prompt – use the pipe-aware template when data was piped in.
+    let full_prompt = if let Some(data) = piped_data {
+        // Truncate the piped data display if it's very large
+        let display_data = if data.len() > MAX_PIPE_BYTES {
+            format!("{}...\n(truncated – {} bytes total)", &data[..MAX_PIPE_BYTES], data.len())
+        } else {
+            data.to_string()
+        };
+        PIPE_PROMPT_TEMPLATE
+            .replace("{piped_data}", &display_data)
+            .replace("{query}", prompt)
+    } else {
+        PROMPT_TEMPLATE.replace("{query}", prompt)
+    };
+
     messages.push(json!({
         "role": "user",
         "content": full_prompt
@@ -811,10 +890,13 @@ fn print_help() {
 Usage:
   ask [--model MODEL] [--theme light|dark] <prompt>   # Single prompt mode
   ask [--model MODEL] [--theme light|dark]             # Interactive mode
+  command | ask \"prompt\"                                # Pipe mode
+  command | ask                                         # Pipe mode (auto-summarize)
 
 Modes:
   Single prompt:    Provide a prompt and get commands to execute
   Interactive:      Enter multiple prompts in a session (type 'exit' or 'quit' to end)
+  Pipe:             Pipe data from any command for AI analysis and transformation
 
 Options:
   --model MODEL     Override the default LLM model ({DEFAULT_MODEL})
@@ -829,6 +911,14 @@ Config:
 
 The tool sends your prompt to OpenRouter, previews the generated commands,
 and asks for confirmation before executing each one in your shell.
+
+Pipe mode examples:
+  git diff | ask \"write a commit message\"
+  cat error.log | ask \"what went wrong?\"
+  ps aux | ask \"what's using the most memory?\"
+  curl -s api.example.com | ask \"extract all emails\"
+  docker logs app | ask \"summarize errors\"
+  cat data.csv | ask                                   # auto-summarizes
 
 Command confirmation options:
   Y/yes (or Enter)  Execute the command
