@@ -11,7 +11,12 @@ export OPENROUTER_ASK_API_KEY="your-key"
 # Single command
 ask "show all python files"
 
-# Interactive mode (new!)
+# Pipe any command through ask for AI analysis
+git diff | ask "write a commit message"
+cat error.log | ask "what went wrong?"
+ps aux | ask "what's using the most memory?"
+
+# Interactive mode
 ask
 > ls              # Instant execution
 > find large files # AI generates command
@@ -40,6 +45,12 @@ ask
 - **Shortcuts**: Quick commands like `q` (quit), `.` (pwd), `..` (cd ..)
 - **Finder Integration**: Type `finder` to open current directory in Finder
 - **Directory Display**: Current folder shown in prompt for constant awareness
+
+### Pipe Mode (New!)
+- **Universal Data Interpreter**: Pipe output from any command for AI analysis
+- **Auto-detection**: Automatically detects piped input — no flags needed
+- **Auto-summarize**: Pipe data without a prompt and get an instant summary
+- **Composable**: Works with every Unix tool — `grep`, `curl`, `docker`, `git`, etc.
 
 ### Command Execution Options
 - **Skip (s)**: Skip current command and continue to next
@@ -134,6 +145,33 @@ ask [ask-cli]> q
 Goodbye!
 ```
 
+### Pipe Mode
+
+Pipe the output of any command into `ask` for AI-powered analysis:
+
+```bash
+# Analyze logs
+cat /var/log/system.log | ask "summarize recent errors"
+docker logs myapp | ask "what's causing the crashes?"
+
+# Code review and git
+git diff | ask "write a commit message for this"
+git log --oneline -20 | ask "summarize recent activity"
+
+# Data analysis
+cat data.csv | ask "find outliers and anomalies"
+curl -s https://api.example.com/users | ask "extract all email addresses"
+
+# System diagnostics
+ps aux | ask "what's using the most memory?"
+df -h | ask "which volumes are running low on space?"
+
+# Auto-summarize (no prompt needed)
+cat README.md | ask
+```
+
+Pipe mode is automatically detected — no flags required. Data up to 64 KB is sent as context to the LLM alongside your prompt.
+
 ### Examples
 
 ```bash
@@ -157,6 +195,7 @@ ask "show all active network connections"
 
 ```bash
 ask [OPTIONS] [prompt]
+command | ask [OPTIONS] [prompt]
 
 Options:
   --model MODEL     Override the default LLM model (default: meta-llama/llama-3.3-70b-instruct)
@@ -164,8 +203,9 @@ Options:
   -h, --help        Show help message
 
 Modes:
-  With prompt:      Single command execution mode
-  Without prompt:   Interactive mode with persistent session
+  With prompt:          Single command execution mode
+  Without prompt:       Interactive mode with persistent session
+  With piped input:     Pipe mode — AI analyses the piped data with your prompt
 ```
 
 ### Command Confirmation Options
