@@ -35,7 +35,7 @@ ask
 - **Safe by Design**: Built-in safeguards against dangerous operations
 - **Theme Support**: Light and dark color themes for terminal readability
 - **Model Selection**: Choose from various LLM models via OpenRouter
-- **Persistent Configuration**: Saves theme preferences locally
+- **Persistent Configuration**: Saves theme and model preferences locally
 - **MacOS & Zsh Optimized**: Tailored for MacOS terminal environment
 
 ### Interactive Mode (New!)
@@ -198,7 +198,7 @@ ask [OPTIONS] [prompt]
 command | ask [OPTIONS] [prompt]
 
 Options:
-  --model MODEL     Override the default LLM model (default: meta-llama/llama-3.3-70b-instruct)
+  --model MODEL     Override the LLM model (default: meta-llama/llama-3.3-70b-instruct)
   --theme MODE      Color theme for prompts (dark or light, default dark)
   -h, --help        Show help message
 
@@ -296,9 +296,17 @@ The config file is located at `~/.ask/config` and uses a simple key-value format
 
 ```
 theme=dark
+model=anthropic/claude-haiku-4.5
 ```
 
-This file is automatically created and updated when using the `--theme` flag.
+Available settings:
+
+| Key | Values | Description |
+|-----|--------|-------------|
+| `theme` | `dark`, `light` | Color theme for terminal output |
+| `model` | Any OpenRouter model ID | LLM model to use (overrides the built-in default) |
+
+The `--model` and `--theme` CLI flags take precedence over config file values. If no model is set in the config, the built-in default (`meta-llama/llama-3.3-70b-instruct`) is used.
 
 ## Dependencies
 
