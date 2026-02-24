@@ -827,8 +827,8 @@ struct Args {
 fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
     let mut prompt_parts = Vec::new();
-    let mut model = DEFAULT_MODEL.to_string();
     let mut config = Config::load();
+    let mut model = config.model.clone().unwrap_or_else(|| DEFAULT_MODEL.to_string());
     let mut theme = config.theme;
     let mut save_theme = false;
 
@@ -907,7 +907,7 @@ Environment:
   OPENROUTER_ASK_API_KEY must be set with your OpenRouter API key.
 
 Config:
-  Default theme preference is stored in ~/.ask/config (theme=light|dark).
+  Preferences are stored in ~/.ask/config (theme=light|dark, model=MODEL).
 
 The tool sends your prompt to OpenRouter, previews the generated commands,
 and asks for confirmation before executing each one in your shell.
@@ -1030,15 +1030,17 @@ impl Theme {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Config {
     theme: ThemeMode,
+    model: Option<String>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             theme: ThemeMode::Dark,
+            model: None,
         }
     }
 }
@@ -1050,18 +1052,26 @@ impl Config {
             None => return Self::default(),
         };
 
-        let contents = fs::read_to_string(path).ok();
-        if let Some(contents) = contents {
-            for line in contents.lines() {
-                if let Some(value) = line.strip_prefix("theme=") {
-                    if let Some(theme) = ThemeMode::from_str(value.trim()) {
-                        return Self { theme };
-                    }
+        let contents = match fs::read_to_string(path).ok() {
+            Some(c) => c,
+            None => return Self::default(),
+        };
+
+        let mut config = Self::default();
+        for line in contents.lines() {
+            if let Some(value) = line.strip_prefix("theme=") {
+                if let Some(theme) = ThemeMode::from_str(value.trim()) {
+                    config.theme = theme;
+                }
+            } else if let Some(value) = line.strip_prefix("model=") {
+                let value = value.trim();
+                if !value.is_empty() {
+                    config.model = Some(value.to_string());
                 }
             }
         }
 
-        Self::default()
+        config
     }
 
     fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -1072,7 +1082,10 @@ impl Config {
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)?;
         }
-        let contents = format!("theme={}\n", self.theme.as_str());
+        let mut contents = format!("theme={}\n", self.theme.as_str());
+        if let Some(ref model) = self.model {
+            contents.push_str(&format!("model={}\n", model));
+        }
         fs::write(path, contents)?;
         Ok(())
     }
