@@ -546,14 +546,15 @@ fn compact_history(history: &[ConversationContext]) -> String {
     context
 }
 
-fn process_prompt_with_context(
+/// Send a prompt to the LLM and return the parsed response lines.
+/// This is the core API call logic, separated from UI concerns for testability.
+fn query_api(
     prompt: &str,
     model: &str,
     api_key: &str,
-    theme: &Theme,
     history: &[ConversationContext],
     piped_data: Option<&str>,
-) -> Result<(Vec<String>, Vec<String>), Box<dyn std::error::Error>> {
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let mut messages = Vec::new();
 
     // Add conversation history as context
@@ -618,6 +619,19 @@ fn process_prompt_with_context(
     if commands.is_empty() {
         return Err("No response returned from the model.".into());
     }
+
+    Ok(commands)
+}
+
+fn process_prompt_with_context(
+    prompt: &str,
+    model: &str,
+    api_key: &str,
+    theme: &Theme,
+    history: &[ConversationContext],
+    piped_data: Option<&str>,
+) -> Result<(Vec<String>, Vec<String>), Box<dyn std::error::Error>> {
+    let commands = query_api(prompt, model, api_key, history, piped_data)?;
 
     // Check if all lines are conversational (start with #)
     let all_conversational = commands.iter().all(|cmd| cmd.starts_with('#'));
@@ -814,7 +828,17 @@ fn parse_commands(content: &str) -> Vec<String> {
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .filter(|line| !line.starts_with("```") && !line.ends_with("```"))
-        .map(|line| line.to_string())
+        .flat_map(|line| {
+            // Split && chains into individual commands, but leave comment lines intact
+            if line.starts_with('#') {
+                vec![line.to_string()]
+            } else {
+                line.split("&&")
+                    .map(|part| part.trim().to_string())
+                    .filter(|part| !part.is_empty())
+                    .collect()
+            }
+        })
         .collect()
 }
 
@@ -1122,5 +1146,186 @@ mod tests {
         assert_eq!(parse_confirmation_choice("skip"), Some(ConfirmChoice::Skip));
         assert_eq!(parse_confirmation_choice("i"), Some(ConfirmChoice::Instruct));
         assert_eq!(parse_confirmation_choice("maybe"), None);
+    }
+
+    #[test]
+    fn parse_commands_splits_chained_commands() {
+        let input = "mkdir myproject && cd myproject && git init";
+        let commands = super::parse_commands(input);
+        assert_eq!(commands, vec!["mkdir myproject", "cd myproject", "git init"]);
+    }
+
+    #[test]
+    fn parse_commands_preserves_comment_lines() {
+        let input = "# This will create a directory && init git\nmkdir foo && cd foo";
+        let commands = super::parse_commands(input);
+        assert_eq!(commands, vec![
+            "# This will create a directory && init git",
+            "mkdir foo",
+            "cd foo",
+        ]);
+    }
+}
+
+/// Integration tests that make real API calls to the configured LLM.
+/// Run with: cargo test -- --ignored --show-output
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// Prints elapsed time when dropped.
+    struct TestTimer {
+        name: &'static str,
+        model: String,
+        start: Instant,
+    }
+
+    impl Drop for TestTimer {
+        fn drop(&mut self) {
+            let elapsed = self.start.elapsed();
+            eprintln!("[{}] model={} elapsed={:.2?}", self.name, self.model, elapsed);
+        }
+    }
+
+    /// Load model and API key from config/env, and start a timer.
+    fn test_setup(name: &'static str) -> (String, String, TestTimer) {
+        let api_key = match env::var("OPENROUTER_ASK_API_KEY") {
+            Ok(key) => key,
+            Err(_) => panic!("OPENROUTER_ASK_API_KEY not set — skipping integration test"),
+        };
+        let config = Config::load();
+        let model = config.model.unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        let timer = TestTimer {
+            name,
+            model: model.clone(),
+            start: Instant::now(),
+        };
+        (model, api_key, timer)
+    }
+
+    #[test]
+    #[ignore]
+    fn returns_a_command_for_simple_request() {
+        let (model, api_key, _t) = test_setup("simple_request");
+        let result = query_api("list files in the current directory", &model, &api_key, &[], None);
+        let commands = result.expect("API call failed");
+        assert!(!commands.is_empty(), "Expected at least one response line");
+        let has_command = commands.iter().any(|c| !c.starts_with('#'));
+        assert!(has_command, "Expected a command, got only comments: {commands:?}");
+    }
+
+    #[test]
+    #[ignore]
+    fn returns_conversational_response_for_question() {
+        let (model, api_key, _t) = test_setup("conversational");
+        let result = query_api("what is Rust?", &model, &api_key, &[], None);
+        let commands = result.expect("API call failed");
+        assert!(!commands.is_empty(), "Expected a response");
+        assert!(
+            commands[0].starts_with('#'),
+            "Expected conversational response (first line should start with #), got: {commands:?}"
+        );
+        let shell_like = commands.iter().any(|c| {
+            let trimmed = c.trim_start_matches('#').trim();
+            trimmed.starts_with("ls ") || trimmed.starts_with("cd ") || trimmed.starts_with("mkdir ")
+                || trimmed.starts_with("rm ") || trimmed.starts_with("sudo ")
+        });
+        assert!(!shell_like, "Expected no shell commands in conversational response: {commands:?}");
+    }
+
+    #[test]
+    #[ignore]
+    fn handles_piped_data() {
+        let (model, api_key, _t) = test_setup("piped_data");
+        let csv_data = "name,age\nAlice,30\nBob,25\nCarol,35";
+        let result = query_api(
+            "how many rows are in this data?",
+            &model,
+            &api_key,
+            &[],
+            Some(csv_data),
+        );
+        let commands = result.expect("API call failed");
+        assert!(!commands.is_empty(), "Expected a response about the data");
+    }
+
+    #[test]
+    #[ignore]
+    fn respects_conversation_history() {
+        let (model, api_key, _t) = test_setup("history");
+        let history = vec![ConversationContext {
+            prompt: "list files".to_string(),
+            commands: vec!["ls -la".to_string()],
+            outputs: vec!["file1.txt\nfile2.txt\nREADME.md".to_string()],
+        }];
+        let result = query_api(
+            "which of those is a markdown file?",
+            &model,
+            &api_key,
+            &history,
+            None,
+        );
+        let commands = result.expect("API call failed");
+        assert!(!commands.is_empty(), "Expected a response referencing history");
+        let response_text = commands.join(" ").to_lowercase();
+        assert!(
+            response_text.contains("readme") || response_text.contains(".md"),
+            "Expected response to mention README.md, got: {commands:?}"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn returns_valid_command_for_process_query() {
+        let (model, api_key, _t) = test_setup("process_query");
+        let result = query_api(
+            "show me what process is using port 8080",
+            &model,
+            &api_key,
+            &[],
+            None,
+        );
+        let commands = result.expect("API call failed");
+        let has_command = commands.iter().any(|c| !c.starts_with('#'));
+        assert!(has_command, "Expected a command for process query, got: {commands:?}");
+        let response_text = commands.join(" ").to_lowercase();
+        assert!(
+            response_text.contains("lsof") || response_text.contains("netstat") || response_text.contains("ss "),
+            "Expected lsof or netstat command, got: {commands:?}"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn does_not_return_code_fences() {
+        let (model, api_key, _t) = test_setup("no_code_fences");
+        let result = query_api("create a new directory called test_dir", &model, &api_key, &[], None);
+        let commands = result.expect("API call failed");
+        for cmd in &commands {
+            assert!(
+                !cmd.contains("```"),
+                "Response should not contain code fences: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn multi_step_command_returns_all_steps() {
+        let (model, api_key, _t) = test_setup("multi_step");
+        let result = query_api(
+            "create a directory called myproject, cd into it, and initialize a git repo",
+            &model,
+            &api_key,
+            &[],
+            None,
+        );
+        let commands = result.expect("API call failed");
+        let response_text = commands.join(" ").to_lowercase();
+        // All three steps should appear — either as separate lines or chained with &&
+        assert!(response_text.contains("mkdir"), "Expected mkdir in response: {commands:?}");
+        assert!(response_text.contains("cd "), "Expected cd in response: {commands:?}");
+        assert!(response_text.contains("git init"), "Expected git init in response: {commands:?}");
     }
 }

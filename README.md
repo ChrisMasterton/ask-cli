@@ -308,6 +308,26 @@ Available settings:
 
 The `--model` and `--theme` CLI flags take precedence over config file values. If no model is set in the config, the built-in default (`meta-llama/llama-3.3-70b-instruct`) is used.
 
+## Model Benchmarks
+
+Integration tests run real prompts against each model via OpenRouter. Results from the test suite:
+
+| Model | Total Time | Fastest Test | All Tests Pass |
+|-------|-----------|-------------|----------------|
+| `meta-llama/llama-3.3-70b-instruct` | 1.65s | — | Yes |
+| `openai/gpt-4o-mini` | 1.87s | — | Yes |
+| `anthropic/claude-haiku-4.5` | 3.32s | — | Yes |
+| `qwen/qwen3-coder-next` | 3.70s | 420ms | Yes |
+| `meta-llama/llama-4-maverick` | 17.21s | 637ms | Yes |
+
+To benchmark with your configured model:
+
+```bash
+cargo test -- --include-ignored --show-output
+```
+
+Times vary by run due to API latency, but relative rankings are consistent.
+
 ## Dependencies
 
 - `serde` - JSON serialization/deserialization
