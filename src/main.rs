@@ -4,7 +4,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, Read as _, Write};
+use std::io::{self, Read as _, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::process::{Command, exit};
@@ -755,8 +755,28 @@ fn read_confirmation_line() -> Result<String, io::Error> {
     // when stdin is redirected or line editing is active.
     match fs::OpenOptions::new().read(true).open("/dev/tty") {
         Ok(tty) => {
+            // Flush any stale input left in the TTY buffer (e.g. from rustyline)
+            // so we only read the user's fresh response.
+            let fd = tty.as_raw_fd();
+            unsafe { libc::tcflush(fd, libc::TCIFLUSH); }
+
+            // Read byte-by-byte and accept both \r and \n as line terminators.
+            // After rustyline restores the terminal, ICRNL may not be set,
+            // causing Enter to send \r instead of \n — which read_line() ignores.
             let mut reader = io::BufReader::new(tty);
-            reader.read_line(&mut input)?;
+            let mut byte = [0u8; 1];
+            loop {
+                match reader.read(&mut byte) {
+                    Ok(0) => break, // EOF
+                    Ok(_) => {
+                        if byte[0] == b'\n' || byte[0] == b'\r' {
+                            break;
+                        }
+                        input.push(byte[0] as char);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
         }
         Err(_) => {
             io::stdin().read_line(&mut input)?;
