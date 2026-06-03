@@ -152,23 +152,28 @@ fn is_script_execution(cmd: &str) -> bool {
         return true;
     }
 
-    // Check if it's a script file by extension
-    if let Some(extension) = cmd.split('.').last() {
-        matches!(extension,
-            "sh" | "bash" | "zsh" |
-            "py" | "python" |
-            "js" | "mjs" | "ts" |
-            "rb" | "ruby" |
-            "pl" | "perl" |
-            "php" |
-            "r" | "R" |
-            "go" | "rs" |
-            "java" | "class" |
-            "swift" | "kt"
-        )
-    } else {
-        false
+    // Check if it's a bare script-file invocation by extension (e.g. `deploy.sh`).
+    // Only a SINGLE token counts: `rm build.sh` is a destructive command whose
+    // argument happens to end in `.sh`, not a script execution — it must not be
+    // auto-whitelisted. Interpreter and `./` forms are already handled above.
+    if cmd.split_whitespace().count() == 1 {
+        if let Some(extension) = cmd.split('.').last() {
+            return matches!(extension,
+                "sh" | "bash" | "zsh" |
+                "py" | "python" |
+                "js" | "mjs" | "ts" |
+                "rb" | "ruby" |
+                "pl" | "perl" |
+                "php" |
+                "r" | "R" |
+                "go" | "rs" |
+                "java" | "class" |
+                "swift" | "kt"
+            );
+        }
     }
+
+    false
 }
 
 // Safe commands that can be executed directly without LLM confirmation
@@ -1141,7 +1146,7 @@ fn config_path() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfirmChoice, normalize_confirmation_input, parse_confirmation_choice};
+    use super::*;
 
     #[test]
     fn normalize_confirmation_input_strips_ansi_sequences() {
@@ -1184,6 +1189,199 @@ mod tests {
             "mkdir foo",
             "cd foo",
         ]);
+    }
+
+    #[test]
+    fn parse_commands_strips_code_fences() {
+        let input = "```bash\nls -la\n```";
+        assert_eq!(parse_commands(input), vec!["ls -la"]);
+    }
+
+    #[test]
+    fn parse_commands_filters_blank_lines_and_trims() {
+        let input = "  ls -la  \n\n   \npwd";
+        assert_eq!(parse_commands(input), vec!["ls -la", "pwd"]);
+    }
+
+    // --- is_safe_direct_command: the whitelist that auto-executes WITHOUT confirmation ---
+
+    #[test]
+    fn safe_direct_command_allows_read_only_commands() {
+        for cmd in [
+            "ls", "ls -la", "cd ..", "cat /etc/hosts", "pwd", "echo hi",
+            "head -n 5 file", "tail file", "grep foo bar.txt", "find . -name x",
+            "wc -l file", "git status", "git log",
+        ] {
+            assert!(is_safe_direct_command(cmd), "expected safe: {cmd}");
+        }
+    }
+
+    #[test]
+    fn safe_direct_command_is_case_insensitive_for_exact_matches() {
+        assert!(is_safe_direct_command("GIT STATUS"));
+        assert!(is_safe_direct_command("PWD"));
+    }
+
+    // Documents a quirk: git/brew/npm/pip entries are matched as exact strings,
+    // so adding ANY argument falls through to requiring confirmation. This is the
+    // conservative direction (err toward asking), but worth pinning down.
+    #[test]
+    fn safe_direct_command_git_with_args_requires_confirmation() {
+        assert!(!is_safe_direct_command("git log --oneline"));
+        assert!(!is_safe_direct_command("git diff HEAD"));
+        assert!(!is_safe_direct_command("brew list --versions"));
+    }
+
+    #[test]
+    fn safe_direct_command_rejects_destructive_or_unknown_commands() {
+        for cmd in [
+            "rm -rf /", "sudo rm -rf /", "git push", "mv a b",
+            "dd if=/dev/zero of=/dev/disk2", "chmod 777 /", "kill -9 1",
+        ] {
+            assert!(!is_safe_direct_command(cmd), "expected NOT safe: {cmd}");
+        }
+    }
+
+    // --- is_script_execution ---
+
+    #[test]
+    fn script_execution_detects_interpreters_and_relative_paths() {
+        for cmd in ["python script.py", "python3 a.py", "node app.js", "bash deploy.sh", "./run.sh"] {
+            assert!(is_script_execution(cmd), "expected script: {cmd}");
+        }
+    }
+
+    #[test]
+    fn script_execution_detects_by_extension() {
+        assert!(is_script_execution("myscript.py"));
+        assert!(is_script_execution("build.rs"));
+    }
+
+    #[test]
+    fn script_execution_ignores_plain_commands() {
+        for cmd in ["ls -la", "git status", "cat notes.md", "make build"] {
+            assert!(!is_script_execution(cmd), "expected not a script: {cmd}");
+        }
+    }
+
+    // Regression: a destructive verb whose argument ends in a script extension
+    // (e.g. `rm build.sh`) must NOT be treated as script execution, otherwise it
+    // would slip into the auto-execute whitelist and skip confirmation.
+    #[test]
+    fn script_execution_does_not_match_verb_with_script_arg() {
+        for cmd in ["rm build.sh", "rm -rf build.sh", "rm notes.py", "rm config.rs", "mv a.js b"] {
+            assert!(!is_script_execution(cmd), "must require confirmation: {cmd}");
+        }
+        // ...but a bare script path still counts.
+        assert!(is_script_execution("deploy.sh"));
+    }
+
+    #[test]
+    fn safe_direct_command_does_not_whitelist_rm_of_script_files() {
+        for cmd in ["rm build.sh", "rm -rf build.sh", "rm notes.py", "rm config.rs"] {
+            assert!(!is_safe_direct_command(cmd), "rm of a script file must require confirmation: {cmd}");
+        }
+    }
+
+    // --- parse_confirmation_choice edge cases ---
+
+    #[test]
+    fn confirmation_empty_input_defaults_to_yes() {
+        assert_eq!(parse_confirmation_choice(""), Some(ConfirmChoice::Yes));
+    }
+
+    #[test]
+    fn confirmation_is_case_insensitive_and_trims() {
+        assert_eq!(parse_confirmation_choice("YES"), Some(ConfirmChoice::Yes));
+        assert_eq!(parse_confirmation_choice("  No  "), Some(ConfirmChoice::No));
+    }
+
+    // --- token estimation ---
+
+    #[test]
+    fn estimate_tokens_uses_four_chars_per_token() {
+        assert_eq!(estimate_tokens(""), 0);
+        assert_eq!(estimate_tokens("abcd"), 1);
+        assert_eq!(estimate_tokens(&"a".repeat(400)), 100);
+    }
+
+    #[test]
+    fn estimate_total_context_size_caps_output_at_500() {
+        let history = vec![ConversationContext {
+            prompt: "abcde".to_string(),        // 5
+            commands: vec!["xyz".to_string()],  // 3
+            outputs: vec!["o".repeat(1000)],    // capped at 500
+        }];
+        assert_eq!(estimate_total_context_size(&history), 5 + 3 + 500);
+    }
+
+    // --- compact_history ---
+
+    #[test]
+    fn compact_history_empty_returns_header_only() {
+        let out = compact_history(&[]);
+        assert!(out.contains("Previous commands and outputs"));
+        assert!(!out.contains("(Note: Showing recent"));
+    }
+
+    #[test]
+    fn compact_history_keeps_chronological_order_for_small_history() {
+        let history = vec![
+            ConversationContext {
+                prompt: "first-prompt".to_string(),
+                commands: vec!["ls".to_string()],
+                outputs: vec![],
+            },
+            ConversationContext {
+                prompt: "second-prompt".to_string(),
+                commands: vec!["pwd".to_string()],
+                outputs: vec![],
+            },
+        ];
+        let out = compact_history(&history);
+        let first = out.find("first-prompt").expect("first present");
+        let second = out.find("second-prompt").expect("second present");
+        assert!(first < second, "expected chronological order");
+        assert!(!out.contains("(Note: Showing recent"));
+    }
+
+    #[test]
+    fn compact_history_truncates_when_over_token_budget() {
+        let history: Vec<ConversationContext> = (0..40)
+            .map(|_| ConversationContext {
+                prompt: "p".repeat(1000),
+                commands: vec![],
+                outputs: vec![],
+            })
+            .collect();
+        let out = compact_history(&history);
+        assert!(out.contains("(Note: Showing recent"), "expected truncation note");
+        assert!(estimate_tokens(&out) <= MAX_CONTEXT_TOKENS, "compacted output must respect budget");
+    }
+
+    // --- ThemeMode ---
+
+    #[test]
+    fn theme_mode_parses_case_insensitively_and_rejects_unknown() {
+        assert!(matches!(ThemeMode::from_str("light"), Some(ThemeMode::Light)));
+        assert!(matches!(ThemeMode::from_str("DARK"), Some(ThemeMode::Dark)));
+        assert!(ThemeMode::from_str("blue").is_none());
+    }
+
+    #[test]
+    fn theme_mode_str_roundtrips() {
+        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            assert_eq!(ThemeMode::from_str(mode.as_str()).unwrap().as_str(), mode.as_str());
+        }
+    }
+
+    #[test]
+    fn theme_wraps_text_with_color_and_reset() {
+        let theme = Theme::from_mode(ThemeMode::Dark);
+        let painted = theme.helper_text("hello");
+        assert!(painted.contains("hello"));
+        assert!(painted.ends_with(RESET));
+        assert!(painted.starts_with(theme.helper_color));
     }
 }
 
