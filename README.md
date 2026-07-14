@@ -308,6 +308,20 @@ Available settings:
 
 The `--model` and `--theme` CLI flags take precedence over config file values. If no model is set in the config, the built-in default (`meta-llama/llama-3.3-70b-instruct`) is used.
 
+## Testing
+
+The default suite is deterministic and does not make API calls:
+
+```bash
+make test
+```
+
+Live OpenRouter contract tests are opt-in, require `OPENROUTER_ASK_API_KEY`, and make real API calls. The 20 live tests cover 24 model samples across action phrasing, conversational responses, quoting, Unicode, stateful command chains, piped data, prompt-injection text, and repeated-response variance:
+
+```bash
+make test-live
+```
+
 ## Model Benchmarks
 
 Integration tests run real prompts against each model via OpenRouter. Results from the test suite:
@@ -323,7 +337,7 @@ Integration tests run real prompts against each model via OpenRouter. Results fr
 To benchmark with your configured model:
 
 ```bash
-cargo test -- --include-ignored --show-output
+make test-live
 ```
 
 Times vary by run due to API latency, but relative rankings are consistent.
