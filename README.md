@@ -2,6 +2,64 @@
 
 A command-line tool that converts natural language prompts into MacOS terminal commands using AI. Built with Rust for speed and reliability.
 
+## See It in Action
+
+Stop googling shell syntax — just say what you want:
+
+```bash
+$ ask "kill whatever is using port 3000"
+run> kill $(lsof -t -i :3000)?  [Y/n/s/i]
+
+$ ask "what's eating my disk space?"
+run> du -sh * | sort -rh | head -10?  [Y/n/s/i]
+
+$ ask "find every file over 500MB in my home folder"
+run> find ~ -type f -size +500M 2>/dev/null?  [Y/n/s/i]
+
+$ ask "undo my last commit but keep the changes"
+run> git reset --soft HEAD~1?  [Y/n/s/i]
+```
+
+It knows the Mac-only tools you can never remember:
+
+```bash
+$ ask "convert all these HEIC photos to jpg"
+run> for f in *.heic; do sips -s format jpeg "$f" --out "${f%.heic}.jpg"; done?  [Y/n/s/i]
+
+$ ask "keep my mac awake for the next 2 hours"
+run> caffeinate -d -t 7200?  [Y/n/s/i]
+
+$ ask "what's my local IP?"
+run> ipconfig getifaddr en0?  [Y/n/s/i]
+
+$ ask "flush the DNS cache"
+run> sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder?  [Y/n/s/i]
+```
+
+Pipe anything into it — logs, diffs, JSON, clipboard contents:
+
+```bash
+git diff | ask "write a commit message"
+docker logs api 2>&1 | ask "why does it keep restarting?"
+pbpaste | ask "pretty-print this JSON"
+cat access.log | ask "top 10 IPs by request count"
+ps aux | ask "what's using the most memory?"
+```
+
+And interactive mode keeps context between prompts, so follow-ups just work:
+
+```
+ask [Downloads]> find dmg files older than a month
+run> find . -name "*.dmg" -mtime +30?  [Y/n/s/i]  y
+./OldInstaller.dmg
+./Slack-4.35.dmg
+
+ask [Downloads]> now delete them
+run> find . -name "*.dmg" -mtime +30 -delete?  [Y/n/s/i]
+```
+
+Generated commands vary by model — but you always see the exact command and approve it before anything runs.
+
 ## Quick Start
 
 ```bash
@@ -12,9 +70,7 @@ export OPENROUTER_ASK_API_KEY="your-key"
 ask "show all python files"
 
 # Pipe any command through ask for AI analysis
-git diff | ask "write a commit message"
 cat error.log | ask "what went wrong?"
-ps aux | ask "what's using the most memory?"
 
 # Interactive mode
 ask
@@ -240,6 +296,11 @@ These commands execute immediately without LLM processing or confirmation:
 
 Note: Plain `ls` automatically executes as `ls -l` for better file information.
 
+Direct execution is conservative: any line containing shell metacharacters
+(`;`, `&`, `|`, `` ` ``, `$`, parentheses, or redirection) or destructive
+`find` flags (`-delete`, `-exec`) always goes through AI review and
+confirmation instead, so nothing can chain onto a whitelisted command.
+
 ### Shortcuts
 
 | Shortcut | Action | Description |
@@ -344,10 +405,10 @@ Times vary by run due to API latency, but relative rankings are consistent.
 
 ## Dependencies
 
-- `serde` - JSON serialization/deserialization
-- `serde_json` - JSON handling
+- `serde` / `serde_json` - JSON serialization/deserialization
 - `ureq` - HTTP client for API requests
-- `dirs` - Cross-platform path utilities
+- `rustyline` - Line editing and history in interactive mode
+- `libc` - Terminal input flushing for confirmations
 
 ## Building
 
