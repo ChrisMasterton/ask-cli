@@ -123,6 +123,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // `ask model [MODEL|reset]` shows or persists the default model.
+    if let Some(prompt) = &args.prompt
+        && let Some(command) = parse_model_command(prompt)
+    {
+        apply_model_command(command, &theme);
+        return Ok(());
+    }
+
     let api_key = env::var("OPENROUTER_ASK_API_KEY")
         .map_err(|_| "Please set the OPENROUTER_ASK_API_KEY environment variable.")?;
 
@@ -182,6 +190,78 @@ fn auto_mode_description(enabled: bool) -> &'static str {
         "Auto mode ON — commands the model marks as safe run without confirmation"
     } else {
         "Auto mode OFF — every generated command asks for confirmation"
+    }
+}
+
+#[derive(Debug)]
+enum ModelCommand {
+    Show,
+    Set(String),
+    Reset,
+}
+
+/// Parses the `model` / `model <id>` / `model reset` command. Anything with
+/// more than one argument is treated as an ordinary prompt, not a command.
+fn parse_model_command(input: &str) -> Option<ModelCommand> {
+    let mut tokens = input.split_whitespace();
+    if !tokens.next()?.eq_ignore_ascii_case("model") {
+        return None;
+    }
+    let Some(arg) = tokens.next() else {
+        return Some(ModelCommand::Show);
+    };
+    if tokens.next().is_some() {
+        return None;
+    }
+    match arg.to_lowercase().as_str() {
+        "reset" | "default" => Some(ModelCommand::Reset),
+        _ => Some(ModelCommand::Set(arg.to_string())),
+    }
+}
+
+/// Shows, persists, or resets the saved model preference. Returns the model
+/// now in effect so interactive mode can switch the live session too.
+fn apply_model_command(command: ModelCommand, theme: &Theme) -> String {
+    let mut config = Config::load();
+    match command {
+        ModelCommand::Show => {
+            let (model, source) = match &config.model {
+                Some(model) => (model.clone(), "saved in ~/.ask/config"),
+                None => (DEFAULT_MODEL.to_string(), "built-in default"),
+            };
+            println!("{}", theme.helper_text(&format!("Model: {model} ({source})")));
+            model
+        }
+        ModelCommand::Set(model) => {
+            if !model.contains('/') {
+                println!(
+                    "{}",
+                    theme.helper_text("Note: OpenRouter model IDs usually look like vendor/model-name")
+                );
+            }
+            config.model = Some(model.clone());
+            if let Err(err) = config.save() {
+                eprintln!("Warning: could not save model preference: {err}");
+            }
+            println!(
+                "{}",
+                theme.helper_text(&format!("Model set to {model} and saved as the default"))
+            );
+            model
+        }
+        ModelCommand::Reset => {
+            config.model = None;
+            if let Err(err) = config.save() {
+                eprintln!("Warning: could not save model preference: {err}");
+            }
+            println!(
+                "{}",
+                theme.helper_text(&format!(
+                    "Model reset to the built-in default ({DEFAULT_MODEL})"
+                ))
+            );
+            DEFAULT_MODEL.to_string()
+        }
     }
 }
 
@@ -337,11 +417,12 @@ fn print_banner(theme: &Theme, auto: bool) {
 }
 
 fn run_interactive_mode(
-    model: &str,
+    initial_model: &str,
     api_key: &str,
     theme: &Theme,
     initial_auto: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let mut model = initial_model.to_string();
     let mut auto = initial_auto;
     print_banner(theme, auto);
 
@@ -475,6 +556,11 @@ fn run_interactive_mode(
             continue;
         }
 
+        if let Some(command) = parse_model_command(input) {
+            model = apply_model_command(command, theme);
+            continue;
+        }
+
         if input == "finder" {
             // Open Finder at current directory
             match Command::new("open").arg(".").status() {
@@ -528,7 +614,7 @@ fn run_interactive_mode(
             continue;
         }
 
-        match process_prompt_with_context(input, model, api_key, theme, &history, None, auto) {
+        match process_prompt_with_context(input, &model, api_key, theme, &history, None, auto) {
             Ok((commands, outputs)) => {
                 // Add to history
                 history.push(ConversationContext {
@@ -1209,6 +1295,12 @@ Config:
 The tool sends your prompt to OpenRouter, previews the generated commands,
 and asks for confirmation before executing each one in your shell.
 
+Model selection:
+  ask model             Show the model in use and where it comes from
+  ask model MODEL       Save MODEL as the default (persisted in ~/.ask/config)
+  ask model reset       Return to the built-in default ({DEFAULT_MODEL})
+  All three also work inside interactive mode; --model overrides for one run.
+
 Auto mode:
   ask auto on / ask auto off (also works inside interactive mode)
 
@@ -1237,7 +1329,8 @@ Interactive mode commands:
   clear             Clear screen and reset conversation context
   finder            Open Finder window at current directory
   auto on|off       Toggle auto-execution of model-labeled-safe commands
-  auto              Show whether auto mode is on"
+  auto              Show whether auto mode is on
+  model [MODEL]     Show or change the saved LLM model (also: model reset)"
     );
 }
 

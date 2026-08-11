@@ -727,6 +727,33 @@ fn on_off_values_parse_case_insensitively() {
     assert_eq!(parse_on_off("sometimes"), None);
 }
 
+#[test]
+fn model_command_parses_show_set_and_reset() {
+    assert!(matches!(parse_model_command("model"), Some(ModelCommand::Show)));
+    assert!(matches!(parse_model_command("  MODEL  "), Some(ModelCommand::Show)));
+    assert!(matches!(
+        parse_model_command("model openai/gpt-4o-mini"),
+        Some(ModelCommand::Set(m)) if m == "openai/gpt-4o-mini"
+    ));
+    assert!(matches!(
+        parse_model_command("model reset"),
+        Some(ModelCommand::Reset)
+    ));
+    assert!(matches!(
+        parse_model_command("model DEFAULT"),
+        Some(ModelCommand::Reset)
+    ));
+}
+
+#[test]
+fn model_command_ignores_ordinary_prompts() {
+    // Multi-word prompts that merely start with "model" must reach the LLM.
+    assert!(parse_model_command("model the data as a table").is_none());
+    assert!(parse_model_command("model reset and then list files").is_none());
+    assert!(parse_model_command("remodel the kitchen").is_none());
+    assert!(parse_model_command("show me the model").is_none());
+}
+
 // --- compact_history ---
 
 #[test]
