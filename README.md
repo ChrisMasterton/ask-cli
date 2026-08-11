@@ -58,7 +58,22 @@ ask [Downloads]> now delete them
 run> find . -name "*.dmg" -mtime +30 -delete?  [Y/n/s/i]
 ```
 
-Generated commands vary by model — but you always see the exact command and approve it before anything runs.
+Once you trust it, turn on auto mode — commands the AI labels as safe run
+instantly, and only destructive ones stop to ask:
+
+```bash
+$ ask auto on
+Auto mode ON — commands the model marks as safe run without confirmation
+
+$ ask "how many lines of rust in this project?"
+run> find . -name "*.rs" -not -path "./target/*" | xargs wc -l (auto)
+    2622 total
+
+$ ask "delete the build cache"
+run> rm -rf target?  [Y/n/s/i]        # destructive → still asks
+```
+
+Generated commands vary by model — but you always see the exact command, and anything destructive is confirmed before it runs.
 
 ## Quick Start
 
@@ -88,10 +103,11 @@ ask
 ### Core Features
 - **Natural Language to Commands**: Describe what you want to do, get the exact shell commands
 - **Interactive Confirmation**: Review and approve commands before they run with multiple options
+- **Auto Mode**: Optionally let AI-labeled-safe commands run without confirmation (`ask auto on`)
 - **Safe by Design**: Built-in safeguards against dangerous operations
 - **Theme Support**: Light and dark color themes for terminal readability
 - **Model Selection**: Choose from various LLM models via OpenRouter
-- **Persistent Configuration**: Saves theme and model preferences locally
+- **Persistent Configuration**: Saves theme, model, and auto-mode preferences locally
 - **MacOS & Zsh Optimized**: Tailored for MacOS terminal environment
 
 ### Interactive Mode (New!)
@@ -181,8 +197,8 @@ Start an interactive session by running `ask` without arguments:
 
 ```bash
 $ ask
-Interactive mode. Commands: 'exit', 'clear', 'finder'
-Common commands (ls, pwd, cat, etc.) execute directly without confirmation
+Interactive mode. Commands: 'exit', 'clear', 'finder', 'auto on|off'
+Common commands and scripts execute directly without confirmation
 Shortcuts: q=quit, .=pwd, ..=cd ..
 📁 /Users/chris/Projects
 
@@ -194,7 +210,6 @@ drwxr-xr-x   8 chris  staff   256 Jan 14 09:15 other-project
 
 ask [Projects]> cd ask-cli
 run> cd ask-cli
-Changed directory to: /Users/chris/Projects/ask-cli
 
 ask [ask-cli]> create a readme file
 run> touch README.md? [Y/n/s/i] y
@@ -264,6 +279,11 @@ Modes:
   With prompt:          Single command execution mode
   Without prompt:       Interactive mode with persistent session
   With piped input:     Pipe mode — AI analyses the piped data with your prompt
+
+Preferences (persisted; no API key required):
+  ask auto on|off       Enable/disable auto-execution of AI-labeled-safe commands
+  ask model [MODEL]     Show or save the default LLM model
+  ask model reset       Return to the built-in default model
 ```
 
 ### Command Confirmation Options
@@ -282,8 +302,21 @@ i/instruct        Execute a custom command first, then return to original
 ### Using Custom Models
 
 ```bash
-ask --model anthropic/claude-3.5-sonnet "your prompt here"
+# One run only (not saved)
+ask --model anthropic/claude-haiku-4.5 "your prompt here"
+
+# Save as the default — persists in ~/.ask/config
+ask model anthropic/claude-haiku-4.5
+
+# Show which model is active and where it comes from
+ask model
+
+# Return to the built-in default
+ask model reset
 ```
+
+The `model` command also works inside interactive mode and switches the
+running session immediately.
 
 ## Interactive Mode Features
 
@@ -314,6 +347,7 @@ confirmation instead, so nothing can chain onto a whitelisted command.
 | `clear` | Clear & Reset | Clear screen and reset context |
 | `auto on` / `auto off` | Toggle auto mode | Run AI-labeled-safe commands without confirmation |
 | `auto` | Show auto state | Report whether auto mode is on |
+| `model [MODEL]` | Show / switch model | Change the LLM for the session and save as default (`model reset` for built-in) |
 
 ### Auto Mode
 
@@ -368,9 +402,10 @@ ask [Projects]> what did we just do?
 
 1. **Prompt Processing**: Your natural language request is sent to OpenRouter's API
 2. **Command Generation**: The AI model generates appropriate MacOS Zsh commands
-3. **Interactive Review**: Generated commands are displayed with syntax highlighting
-4. **User Confirmation**: You approve or reject each command before execution
-5. **Safe Execution**: Approved commands run in your default shell
+3. **Safety Verdict**: The model labels its own response `SAFE: yes` (read-only) or `SAFE: no` (destructive)
+4. **Interactive Review**: Generated commands are displayed with syntax highlighting
+5. **User Confirmation**: You approve or reject each command before execution — or, with auto mode on, safe-labeled commands run immediately
+6. **Safe Execution**: Approved commands run in your default shell
 
 ## Safety Features
 
@@ -394,6 +429,7 @@ The config file is located at `~/.ask/config` and uses a simple key-value format
 ```
 theme=dark
 model=anthropic/claude-haiku-4.5
+auto=off
 ```
 
 Available settings:
@@ -401,7 +437,7 @@ Available settings:
 | Key | Values | Description |
 |-----|--------|-------------|
 | `theme` | `dark`, `light` | Color theme for terminal output |
-| `model` | Any OpenRouter model ID | LLM model to use (overrides the built-in default) |
+| `model` | Any OpenRouter model ID | LLM model to use (set via `ask model <id>`; overrides the built-in default) |
 | `auto` | `on`, `off` | Run AI-labeled-safe commands without confirmation (set via `ask auto on`) |
 
 The `--model` and `--theme` CLI flags take precedence over config file values. If no model is set in the config, the built-in default (`meta-llama/llama-3.3-70b-instruct`) is used.
@@ -414,7 +450,7 @@ The default suite is deterministic and does not make API calls:
 make test
 ```
 
-Live OpenRouter contract tests are opt-in, require `OPENROUTER_ASK_API_KEY`, and make real API calls. The 20 live tests cover 24 model samples across action phrasing, conversational responses, quoting, Unicode, stateful command chains, piped data, prompt-injection text, and repeated-response variance:
+Live OpenRouter contract tests are opt-in, require `OPENROUTER_ASK_API_KEY`, and make real API calls. The 22 live tests cover 26 model samples across action phrasing, conversational responses, safety verdicts, quoting, Unicode, stateful command chains, piped data, prompt-injection text, and repeated-response variance:
 
 ```bash
 make test-live
