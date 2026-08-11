@@ -1,9 +1,49 @@
 use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn ask_command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ask"));
     command.stdin(Stdio::null());
     command
+}
+
+#[test]
+fn auto_toggle_persists_to_config_without_requiring_api_key() {
+    // Point HOME at a scratch dir so the test never touches the real config.
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_nanos();
+    let fake_home = std::env::temp_dir().join(format!("ask-auto-home-{}-{nonce}", std::process::id()));
+    std::fs::create_dir_all(&fake_home).expect("create fake home");
+
+    let output = ask_command()
+        .args(["auto", "on"])
+        .env("HOME", &fake_home)
+        .env_remove("OPENROUTER_ASK_API_KEY")
+        .output()
+        .expect("run ask auto on");
+
+    assert!(output.status.success(), "auto toggle must not need an API key");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Auto mode ON"));
+
+    let config = std::fs::read_to_string(fake_home.join(".ask").join("config"))
+        .expect("config file written");
+    assert!(config.contains("auto=on"), "config should persist auto: {config}");
+
+    let output = ask_command()
+        .args(["auto", "off"])
+        .env("HOME", &fake_home)
+        .env_remove("OPENROUTER_ASK_API_KEY")
+        .output()
+        .expect("run ask auto off");
+    assert!(output.status.success());
+
+    let config = std::fs::read_to_string(fake_home.join(".ask").join("config"))
+        .expect("config file written");
+    assert!(config.contains("auto=off"), "config should persist auto: {config}");
+
+    let _ = std::fs::remove_dir_all(&fake_home);
 }
 
 #[test]

@@ -23,6 +23,10 @@ You are a command-line assistant specialized in MacOS Zsh scripting, helping use
 
 **Instructions:**
 - Analyze if the user is requesting an action/command or making a statement/asking a question
+- The FIRST line of every response must be a safety verdict: `SAFE: yes` or `SAFE: no`
+  - `SAFE: yes` — every command is read-only or trivially reversible (listing, viewing, navigating, querying status)
+  - `SAFE: no` — any command modifies, deletes, moves or overwrites files or data, kills processes, installs software, or changes system or git state
+  - If the response contains no commands at all, use `SAFE: yes`
 - For ACTION REQUESTS: Generate the appropriate terminal commands
   - Return **only the command**, unless explicitly asked to explain
   - Use **safe practices** (avoid dangerous commands like `rm -rf /`)
@@ -39,15 +43,18 @@ You are a command-line assistant specialized in MacOS Zsh scripting, helping use
 **Examples:**
 User: How do I kill a process running on port 5234?
 Response:
+  SAFE: no
   lsof -i :5234
   kill $(lsof -t -i :5234)
 
 User: this is a great tool
 Response:
+  SAFE: yes
   # Thank you! I'm glad you're finding it helpful. Feel free to ask me to run any commands or questions you have.
 
 User: what did we just do?
 Response:
+  SAFE: yes
   # We just [explain the previous actions based on context]. Is there anything else you'd like to do?
 
 **User request:** {query}
@@ -64,6 +71,7 @@ The user has piped the following data to you via stdin:
 
 **Instructions:**
 - The user's request relates to the piped data above
+- The FIRST line of every response must be `SAFE: yes` (no commands, or only read-only commands) or `SAFE: no` (any command that could modify or delete data)
 - If the user asks you to analyze, summarize, filter, transform, or explain the data, respond conversationally (prefix lines with `# `)
 - If the user asks you to generate a command that processes data like this, return the command
 - If no specific request is given, provide a brief, useful summary of the data (prefix with `# `)
@@ -107,6 +115,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args()?;
     let theme = Theme::from_mode(args.theme);
 
+    // `ask auto on` / `ask auto off` toggles auto mode without an API call.
+    if let Some(prompt) = &args.prompt
+        && let Some(enabled) = parse_auto_toggle(prompt)
+    {
+        set_auto_mode(enabled, &theme);
+        return Ok(());
+    }
+
     let api_key = env::var("OPENROUTER_ASK_API_KEY")
         .map_err(|_| "Please set the OPENROUTER_ASK_API_KEY environment variable.")?;
 
@@ -119,6 +135,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 &api_key,
                 &theme,
                 piped_data.as_deref(),
+                args.auto,
             )?;
         }
         None if piped_data.is_some() => {
@@ -129,15 +146,43 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 &api_key,
                 &theme,
                 piped_data.as_deref(),
+                args.auto,
             )?;
         }
         None => {
             // Interactive mode (no pipe)
-            run_interactive_mode(&args.model, &api_key, &theme)?;
+            run_interactive_mode(&args.model, &api_key, &theme, args.auto)?;
         }
     }
 
     Ok(())
+}
+
+/// Parses the `auto on` / `auto off` toggle command.
+fn parse_auto_toggle(input: &str) -> Option<bool> {
+    match input.trim().to_lowercase().as_str() {
+        "auto on" => Some(true),
+        "auto off" => Some(false),
+        _ => None,
+    }
+}
+
+/// Persists the auto-mode preference and reports the new state.
+fn set_auto_mode(enabled: bool, theme: &Theme) {
+    let mut config = Config::load();
+    config.auto = enabled;
+    if let Err(err) = config.save() {
+        eprintln!("Warning: could not save auto preference: {err}");
+    }
+    println!("{}", theme.helper_text(auto_mode_description(enabled)));
+}
+
+fn auto_mode_description(enabled: bool) -> &'static str {
+    if enabled {
+        "Auto mode ON — commands the model marks as safe run without confirmation"
+    } else {
+        "Auto mode OFF — every generated command asks for confirmation"
+    }
 }
 
 // Shell metacharacters that can smuggle extra commands past the whitelist
@@ -267,10 +312,10 @@ fn is_safe_direct_command(cmd: &str) -> bool {
     SAFE_EXACT.contains(&cmd_lower.as_str())
 }
 
-fn print_banner(theme: &Theme) {
+fn print_banner(theme: &Theme, auto: bool) {
     println!(
         "{}",
-        theme.prompt_text("Interactive mode. Commands: 'exit', 'clear', 'finder'")
+        theme.prompt_text("Interactive mode. Commands: 'exit', 'clear', 'finder', 'auto on|off'")
     );
     println!(
         "{}",
@@ -280,6 +325,9 @@ fn print_banner(theme: &Theme) {
         "{}",
         theme.helper_text("Shortcuts: q=quit, .=pwd, ..=cd ..")
     );
+    if auto {
+        println!("{}", theme.helper_text(auto_mode_description(true)));
+    }
 
     // Show current directory
     if let Ok(cwd) = env::current_dir() {
@@ -292,8 +340,10 @@ fn run_interactive_mode(
     model: &str,
     api_key: &str,
     theme: &Theme,
+    initial_auto: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    print_banner(theme);
+    let mut auto = initial_auto;
+    print_banner(theme, auto);
 
     let mut rl = DefaultEditor::new()?;
     let mut history: Vec<ConversationContext> = Vec::new();
@@ -410,7 +460,18 @@ fn run_interactive_mode(
             // Clear the screen and reset context
             Command::new("clear").status()?;
             history.clear();
-            print_banner(theme);
+            print_banner(theme, auto);
+            continue;
+        }
+
+        if let Some(enabled) = parse_auto_toggle(input) {
+            auto = enabled;
+            set_auto_mode(enabled, theme);
+            continue;
+        }
+
+        if input == "auto" {
+            println!("{}", theme.helper_text(auto_mode_description(auto)));
             continue;
         }
 
@@ -467,7 +528,7 @@ fn run_interactive_mode(
             continue;
         }
 
-        match process_prompt_with_context(input, model, api_key, theme, &history, None) {
+        match process_prompt_with_context(input, model, api_key, theme, &history, None, auto) {
             Ok((commands, outputs)) => {
                 // Add to history
                 history.push(ConversationContext {
@@ -496,9 +557,10 @@ fn process_prompt(
     api_key: &str,
     theme: &Theme,
     piped_data: Option<&str>,
+    auto_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let starting_dir = env::current_dir().ok();
-    process_prompt_with_context(prompt, model, api_key, theme, &[], piped_data)?;
+    process_prompt_with_context(prompt, model, api_key, theme, &[], piped_data, auto_mode)?;
     if let (Some(starting_dir), Ok(final_dir)) = (starting_dir, env::current_dir())
         && starting_dir != final_dir
     {
@@ -625,7 +687,8 @@ fn build_prompt(prompt: &str, piped_data: Option<&str>) -> String {
     }
 }
 
-/// Send a prompt to the LLM and return the parsed response lines.
+/// Send a prompt to the LLM and return the parsed response lines plus the
+/// model's safety verdict.
 /// This is the core API call logic, separated from UI concerns for testability.
 fn query_api(
     prompt: &str,
@@ -633,7 +696,7 @@ fn query_api(
     api_key: &str,
     history: &[ConversationContext],
     piped_data: Option<&str>,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+) -> Result<LlmReply, Box<dyn std::error::Error>> {
     let mut messages = Vec::new();
 
     // Add conversation history as context
@@ -685,7 +748,7 @@ fn query_api(
 
 fn commands_from_api_response(
     api_response: ApiResponse,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+) -> Result<LlmReply, Box<dyn std::error::Error>> {
     let Some(content) = api_response
         .choices
         .first()
@@ -694,13 +757,57 @@ fn commands_from_api_response(
         return Err("No command returned from the model.".into());
     };
 
-    let commands = parse_commands(content);
+    let (verdict, content) = extract_safety_marker(content);
+    let commands = parse_commands(&content);
 
     if commands.is_empty() {
         return Err("No response returned from the model.".into());
     }
 
-    Ok(commands)
+    // A response with no executable lines is trivially safe. Otherwise a
+    // missing or malformed verdict means we must assume destructive.
+    let safe = if commands.iter().all(|line| line.starts_with('#')) {
+        true
+    } else {
+        verdict.unwrap_or(false)
+    };
+
+    Ok(LlmReply { commands, safe })
+}
+
+/// Extracts the leading `SAFE: yes|no` verdict from the model's response,
+/// returning the verdict (None when absent or malformed) and the content
+/// with the verdict line removed. Only the first meaningful line counts —
+/// a `SAFE:` string later in the response is treated as ordinary content.
+fn extract_safety_marker(content: &str) -> (Option<bool>, String) {
+    for (idx, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("```") {
+            continue;
+        }
+        // Tolerate models that decorate the verdict (`# SAFE: yes`, `**SAFE: no**`).
+        let candidate = trimmed.trim_start_matches(['#', '*']).trim_start();
+        let lower = candidate.to_lowercase();
+        let verdict = lower.strip_prefix("safe:").and_then(|value| {
+            match value.trim().trim_end_matches('*').trim_end() {
+                "yes" | "true" => Some(true),
+                "no" | "false" => Some(false),
+                _ => None,
+            }
+        });
+        return match verdict {
+            Some(v) => {
+                let rest: Vec<&str> = content
+                    .lines()
+                    .enumerate()
+                    .filter_map(|(i, l)| (i != idx).then_some(l))
+                    .collect();
+                (Some(v), rest.join("\n"))
+            }
+            None => (None, content.to_string()),
+        };
+    }
+    (None, content.to_string())
 }
 
 fn process_prompt_with_context(
@@ -710,14 +817,37 @@ fn process_prompt_with_context(
     theme: &Theme,
     history: &[ConversationContext],
     piped_data: Option<&str>,
+    auto_mode: bool,
 ) -> Result<(Vec<String>, Vec<String>), Box<dyn std::error::Error>> {
-    let commands = query_api(prompt, model, api_key, history, piped_data)?;
-    execute_commands_with(commands, theme, confirm, run_command_with_output)
+    let reply = query_api(prompt, model, api_key, history, piped_data)?;
+    // Auto mode never applies when untrusted piped data is in context — its
+    // contents could have coaxed the model into a bogus `SAFE: yes`.
+    let auto_execute = auto_mode && reply.safe && piped_data.is_none();
+    execute_commands_with(
+        reply.commands,
+        theme,
+        auto_execute,
+        confirm,
+        run_command_with_output,
+    )
+}
+
+// Commands that never run without explicit confirmation, even when the model
+// marks its response safe — a backstop against a misjudged or injected
+// `SAFE: yes` verdict.
+fn never_auto_execute(command: &str) -> bool {
+    const DENY: &[&str] = &[
+        "rm", "rmdir", "sudo", "dd", "shutdown", "reboot", "halt", "kill", "killall",
+    ];
+    command
+        .split_whitespace()
+        .any(|token| DENY.contains(&token) || token.starts_with("mkfs"))
 }
 
 fn execute_commands_with<C, E>(
     commands: Vec<String>,
     theme: &Theme,
+    auto_execute: bool,
     mut confirm_command: C,
     mut execute_command: E,
 ) -> Result<(Vec<String>, Vec<String>), Box<dyn std::error::Error>>
@@ -734,6 +864,19 @@ where
                 "{}\n",
                 theme.helper_text(command.trim_start_matches('#').trim())
             );
+            continue;
+        }
+
+        if auto_execute && !never_auto_execute(&command) {
+            println!(
+                "{} {} {}",
+                theme.prompt_text("run>"),
+                theme.command_text(&command),
+                theme.helper_text("(auto)")
+            );
+            let output = execute_command(&command)?;
+            executed_commands.push(command.clone());
+            command_outputs.push(output);
             continue;
         }
 
@@ -970,6 +1113,7 @@ struct Args {
     prompt: Option<String>, // None indicates interactive mode
     model: String,
     theme: ThemeMode,
+    auto: bool,
 }
 
 fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
@@ -1031,6 +1175,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         prompt,
         model,
         theme,
+        auto: config.auto,
     })
 }
 
@@ -1058,10 +1203,20 @@ Environment:
   OPENROUTER_ASK_API_KEY must be set with your OpenRouter API key.
 
 Config:
-  Preferences are stored in ~/.ask/config (theme=light|dark, model=MODEL).
+  Preferences are stored in ~/.ask/config
+  (theme=light|dark, model=MODEL, auto=on|off).
 
 The tool sends your prompt to OpenRouter, previews the generated commands,
 and asks for confirmation before executing each one in your shell.
+
+Auto mode:
+  ask auto on / ask auto off (also works inside interactive mode)
+
+  The model labels each response safe or destructive. When auto mode is ON,
+  commands labeled safe run immediately without the [Y/n/s/i] prompt.
+  Destructive or unlabeled commands, piped-data sessions, and a deny-list
+  (rm, sudo, dd, kill, ...) always ask for confirmation. The setting is
+  remembered between sessions.
 
 Pipe mode examples:
   git diff | ask \"write a commit message\"
@@ -1080,8 +1235,26 @@ Command confirmation options:
 Interactive mode commands:
   exit / quit       Exit interactive mode
   clear             Clear screen and reset conversation context
-  finder            Open Finder window at current directory"
+  finder            Open Finder window at current directory
+  auto on|off       Toggle auto-execution of model-labeled-safe commands
+  auto              Show whether auto mode is on"
     );
+}
+
+/// Parsed model response: the returned lines plus the model's own verdict on
+/// whether every command is non-destructive (consumed by auto mode).
+#[derive(Debug)]
+struct LlmReply {
+    commands: Vec<String>,
+    safe: bool,
+}
+
+impl std::ops::Deref for LlmReply {
+    type Target = Vec<String>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.commands
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1185,6 +1358,7 @@ impl Theme {
 struct Config {
     theme: ThemeMode,
     model: Option<String>,
+    auto: bool,
 }
 
 impl Default for Config {
@@ -1192,7 +1366,16 @@ impl Default for Config {
         Self {
             theme: ThemeMode::Dark,
             model: None,
+            auto: false,
         }
+    }
+}
+
+fn parse_on_off(value: &str) -> Option<bool> {
+    match value.to_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" => Some(true),
+        "off" | "false" | "no" | "0" => Some(false),
+        _ => None,
     }
 }
 
@@ -1219,6 +1402,10 @@ impl Config {
                 if !value.is_empty() {
                     config.model = Some(value.to_string());
                 }
+            } else if let Some(value) = line.strip_prefix("auto=")
+                && let Some(auto) = parse_on_off(value.trim())
+            {
+                config.auto = auto;
             }
         }
 
@@ -1237,6 +1424,10 @@ impl Config {
         if let Some(ref model) = self.model {
             contents.push_str(&format!("model={}\n", model));
         }
+        contents.push_str(&format!(
+            "auto={}\n",
+            if self.auto { "on" } else { "off" }
+        ));
         fs::write(path, contents)?;
         Ok(())
     }

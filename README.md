@@ -112,6 +112,8 @@ ask
 - **Skip (s)**: Skip current command and continue to next
 - **Instruct (i)**: Run a custom command first, then return to original
 - **Conversational Responses**: AI can respond without generating commands
+- **Auto Mode**: `auto on` lets commands the AI labels as safe run without
+  confirmation — destructive ones still ask (persists across sessions)
 
 ## Installation
 
@@ -310,6 +312,37 @@ confirmation instead, so nothing can chain onto a whitelisted command.
 | `..` | `cd ..` | Go up one directory |
 | `finder` | Open Finder | Open current directory in Finder |
 | `clear` | Clear & Reset | Clear screen and reset context |
+| `auto on` / `auto off` | Toggle auto mode | Run AI-labeled-safe commands without confirmation |
+| `auto` | Show auto state | Report whether auto mode is on |
+
+### Auto Mode
+
+Every AI response starts with a safety verdict (`SAFE: yes` / `SAFE: no`)
+judging whether its commands are read-only or destructive. With auto mode on,
+commands the model marks safe run immediately — no `[Y/n/s/i]` prompt:
+
+```
+ask [Projects]> how big is this folder?
+run> du -sh . (auto)
+1.2G    .
+```
+
+Toggle it with `auto on` / `auto off` in interactive mode, or from the shell:
+
+```bash
+ask auto on
+ask auto off
+```
+
+The setting is saved to `~/.ask/config` and remembered across sessions.
+
+Auto mode is deliberately conservative. Confirmation is still required when:
+
+- the model marks the response destructive (`SAFE: no`)
+- the response has no verdict at all (treated as destructive)
+- the command contains `rm`, `sudo`, `dd`, `kill`, or similar — a built-in
+  deny-list that overrides even a `SAFE: yes` verdict
+- data was piped in (piped content could trick the model into a false verdict)
 
 ### Context Management
 
@@ -347,9 +380,12 @@ ask [Projects]> what did we just do?
   - Skip option to bypass without exiting
   - Instruct option to run custom commands first
 - Safe practices baked into the AI prompt
-- No automatic execution without user approval
+- No automatic execution without user approval (unless auto mode is explicitly enabled)
 - Direct execution limited to read-only commands
 - Dangerous operations always require confirmation
+- Auto mode has layered safeguards: a missing safety verdict counts as
+  destructive, a deny-list (`rm`, `sudo`, `dd`, ...) overrides the model's
+  verdict, and piped-data sessions never auto-execute
 
 ## Configuration File
 
@@ -366,6 +402,7 @@ Available settings:
 |-----|--------|-------------|
 | `theme` | `dark`, `light` | Color theme for terminal output |
 | `model` | Any OpenRouter model ID | LLM model to use (overrides the built-in default) |
+| `auto` | `on`, `off` | Run AI-labeled-safe commands without confirmation (set via `ask auto on`) |
 
 The `--model` and `--theme` CLI flags take precedence over config file values. If no model is set in the config, the built-in default (`meta-llama/llama-3.3-70b-instruct`) is used.
 

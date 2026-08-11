@@ -67,6 +67,7 @@ fn confirmed_commands_execute_exactly_once_and_comments_never_execute() {
     let result = execute_commands_with(
         vec!["# explanation".to_string(), "touch marker".to_string()],
         &theme,
+        false,
         |command, _| {
             confirmed.push(command.to_string());
             Ok(confirmations.pop_front().expect("confirmation response"))
@@ -102,6 +103,7 @@ fn skip_and_cancel_never_execute_the_rejected_commands() {
             "never-reached".to_string(),
         ],
         &theme,
+        false,
         |_, _| Ok(confirmations.pop_front().expect("confirmation response")),
         |command| {
             executed.push(command.to_string());
@@ -123,6 +125,7 @@ fn failed_execution_stops_the_flow_without_claiming_later_commands_ran() {
     let result = execute_commands_with(
         vec!["fails".to_string(), "must-not-run".to_string()],
         &theme,
+        false,
         |_, _| Ok(ConfirmResponse::Yes),
         |command| {
             executed.push(command.to_string());
@@ -146,6 +149,7 @@ fn instruct_runs_custom_command_then_original_once_after_reconfirmation() {
     let result = execute_commands_with(
         vec!["rm old-file".to_string()],
         &theme,
+        false,
         |_, _| Ok(confirmations.pop_front().expect("confirmation response")),
         |command| {
             executed.push(command.to_string());
@@ -549,19 +553,178 @@ fn api_response_requires_a_choice_and_nonempty_content() {
 
 #[test]
 fn api_response_is_parsed_into_comments_and_intact_shell_lines() {
-    let commands = commands_from_api_response(ApiResponse {
+    let reply = commands_from_api_response(ApiResponse {
         choices: vec![Choice {
             message: Message {
-                content: "# Set up the repo\nmkdir app && cd app && git init".to_string(),
+                content: "SAFE: no\n# Set up the repo\nmkdir app && cd app && git init"
+                    .to_string(),
             },
         }],
     })
     .expect("valid model response");
 
     assert_eq!(
-        commands,
+        reply.commands,
         vec!["# Set up the repo", "mkdir app && cd app && git init"]
     );
+    assert!(!reply.safe);
+}
+
+// --- safety verdict and auto mode ---
+
+#[test]
+fn safety_marker_is_parsed_and_stripped() {
+    let (verdict, rest) = extract_safety_marker("SAFE: yes\nls -la");
+    assert_eq!(verdict, Some(true));
+    assert_eq!(rest, "ls -la");
+
+    let (verdict, rest) = extract_safety_marker("safe: NO\nrm -rf build");
+    assert_eq!(verdict, Some(false));
+    assert_eq!(rest, "rm -rf build");
+}
+
+#[test]
+fn safety_marker_tolerates_decoration_and_fences() {
+    let (verdict, _) = extract_safety_marker("# SAFE: yes\nls");
+    assert_eq!(verdict, Some(true));
+
+    let (verdict, _) = extract_safety_marker("**SAFE: no**\nrm x");
+    assert_eq!(verdict, Some(false));
+
+    let (verdict, rest) = extract_safety_marker("```\nSAFE: no\nrm x\n```");
+    assert_eq!(verdict, Some(false));
+    assert!(rest.contains("rm x"));
+}
+
+#[test]
+fn missing_or_malformed_marker_yields_no_verdict() {
+    assert_eq!(extract_safety_marker("ls -la").0, None);
+    assert_eq!(extract_safety_marker("SAFE: maybe\nls").0, None);
+    // Only the FIRST meaningful line counts as a verdict.
+    assert_eq!(extract_safety_marker("# hello\nSAFE: yes\nls").0, None);
+}
+
+#[test]
+fn reply_without_verdict_defaults_to_requiring_confirmation() {
+    let reply = commands_from_api_response(ApiResponse {
+        choices: vec![Choice {
+            message: Message {
+                content: "mkdir app".to_string(),
+            },
+        }],
+    })
+    .expect("valid response");
+    assert!(!reply.safe, "a missing verdict must be treated as unsafe");
+}
+
+#[test]
+fn verdict_yes_marks_reply_safe() {
+    let reply = commands_from_api_response(ApiResponse {
+        choices: vec![Choice {
+            message: Message {
+                content: "SAFE: yes\nls -la".to_string(),
+            },
+        }],
+    })
+    .expect("valid response");
+    assert!(reply.safe);
+    assert_eq!(reply.commands, vec!["ls -la"]);
+}
+
+#[test]
+fn conversational_reply_without_commands_is_always_safe() {
+    let reply = commands_from_api_response(ApiResponse {
+        choices: vec![Choice {
+            message: Message {
+                content: "# hello there!".to_string(),
+            },
+        }],
+    })
+    .expect("valid response");
+    assert!(reply.safe, "a reply with no commands defaults to safe");
+}
+
+#[test]
+fn auto_mode_executes_safe_commands_without_confirmation() {
+    let theme = Theme::from_mode(ThemeMode::Dark);
+    let mut executed = Vec::new();
+
+    let result = execute_commands_with(
+        vec!["# listing files".to_string(), "ls -la".to_string()],
+        &theme,
+        true,
+        |_, _| -> Result<ConfirmResponse, io::Error> {
+            panic!("auto mode must not prompt for a safe command")
+        },
+        |command| {
+            executed.push(command.to_string());
+            Ok("ok".to_string())
+        },
+    )
+    .expect("auto flow should succeed");
+
+    assert_eq!(executed, vec!["ls -la"]);
+    assert_eq!(result.0, vec!["ls -la"]);
+}
+
+#[test]
+fn auto_mode_still_confirms_denylisted_commands() {
+    let theme = Theme::from_mode(ThemeMode::Dark);
+    let mut confirmed = Vec::new();
+    let mut executed = Vec::new();
+
+    let result = execute_commands_with(
+        vec!["rm -rf ./build".to_string()],
+        &theme,
+        true,
+        |command, _| {
+            confirmed.push(command.to_string());
+            Ok(ConfirmResponse::No)
+        },
+        |command| {
+            executed.push(command.to_string());
+            Ok(String::new())
+        },
+    )
+    .expect("deny-listed flow should succeed");
+
+    assert_eq!(confirmed, vec!["rm -rf ./build"]);
+    assert!(executed.is_empty());
+    assert!(result.0.is_empty());
+}
+
+#[test]
+fn deny_list_blocks_dangerous_commands_from_auto_execution() {
+    for cmd in [
+        "rm -rf /",
+        "sudo shutdown -h now",
+        "echo done && rm cache.txt",
+        "dd if=/dev/zero of=/dev/disk2",
+        "kill $(lsof -t -i :3000)",
+        "mkfs.ext4 /dev/sdb1",
+    ] {
+        assert!(never_auto_execute(cmd), "must never auto-run: {cmd}");
+    }
+    for cmd in ["ls -la", "git status", "du -sh * | sort -rh"] {
+        assert!(!never_auto_execute(cmd), "safe to auto-run: {cmd}");
+    }
+}
+
+#[test]
+fn auto_toggle_parses_only_exact_commands() {
+    assert_eq!(parse_auto_toggle("auto on"), Some(true));
+    assert_eq!(parse_auto_toggle("  AUTO OFF "), Some(false));
+    assert_eq!(parse_auto_toggle("auto"), None);
+    assert_eq!(parse_auto_toggle("automate everything"), None);
+}
+
+#[test]
+fn on_off_values_parse_case_insensitively() {
+    assert_eq!(parse_on_off("on"), Some(true));
+    assert_eq!(parse_on_off("TRUE"), Some(true));
+    assert_eq!(parse_on_off("off"), Some(false));
+    assert_eq!(parse_on_off("0"), Some(false));
+    assert_eq!(parse_on_off("sometimes"), None);
 }
 
 // --- compact_history ---
