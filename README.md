@@ -73,6 +73,24 @@ $ ask "delete the build cache"
 run> rm -rf target?  [Y/n/s/i]        # destructive → still asks
 ```
 
+When a one-liner isn't enough, have it write you a reusable tool — reviewed
+once, saved forever, run again by name:
+
+```bash
+$ ask tool new ports "list processes listening on tcp ports with pid and command"
+--- ports (bash) ---
+#!/bin/bash
+lsof -iTCP -sTCP:LISTEN -P -n | awk 'NR>1 {print $2, $1, $9}' | sort -u
+---
+Save and approve this script? [y/N] y
+Saved ~/.ask/tools/ports/main.sh — run it with: $ports <args>
+
+$ ask '$ports'
+run> bash '/Users/you/.ask/tools/ports/main.sh'
+515 rapportd *:50761
+7723 node *:3000
+```
+
 Generated commands vary by model — but you always see the exact command, and anything destructive is confirmed before it runs.
 
 ## Quick Start
@@ -123,6 +141,13 @@ ask
 - **Auto-detection**: Automatically detects piped input — no flags needed
 - **Auto-summarize**: Pipe data without a prompt and get an instant summary
 - **Composable**: Works with every Unix tool — `grep`, `curl`, `docker`, `git`, etc.
+
+### Tool Library (New!)
+- **AI-Written Tools**: `tool new <name> <description>` has the LLM write a reusable bash/python script
+- **Review Before Save**: The full source is shown and needs your explicit approval
+- **Checksum-Gated**: Any change to an approved script blocks execution until re-reviewed
+- **Run by Name**: `$name args` in interactive mode, `ask '$name args'` from the shell
+- **Improve, Don't Regenerate**: `tool improve <name> <instructions>` updates the existing script
 
 ### Command Execution Options
 - **Skip (s)**: Skip current command and continue to next
@@ -284,6 +309,12 @@ Preferences (persisted; no API key required):
   ask auto on|off       Enable/disable auto-execution of AI-labeled-safe commands
   ask model [MODEL]     Show or save the default LLM model
   ask model reset       Return to the built-in default model
+
+Tool library (only new/improve need the API key):
+  ask tool new NAME DESCRIPTION     LLM writes a reusable script; review + approve
+  ask 'tool improve NAME ...'       Update an existing tool; review + approve
+  ask tool list|show|approve|rm     Manage saved tools
+  ask '$NAME args'                  Run an approved tool
 ```
 
 ### Command Confirmation Options
@@ -318,6 +349,42 @@ ask model reset
 The `model` command also works inside interactive mode and switches the
 running session immediately.
 
+## Tool Library
+
+`ask` can save the scripts it writes so they never need regenerating. Each
+tool lives in `~/.ask/tools/<name>/` — a `main.sh` or `main.py` (bash and
+Python 3 stdlib only, no package managers) plus a small manifest with its
+description and an approval checksum.
+
+```bash
+# Create: the LLM writes the script, you review the source, approve saves it
+ask tool new dedupe "find duplicate files by content hash in a directory"
+
+# Run it any time — no API call, works offline (quote the sigil in your shell)
+ask '$dedupe ~/Downloads'
+
+# Improve it later: the current source + your instructions go to the LLM,
+# you review the new version, approving overwrites and re-checksums
+ask tool improve dedupe "add a --delete flag that keeps the newest copy"
+
+# Manage the library
+ask tool list             # every tool with lang, description, approval state
+ask tool show dedupe      # print the source and status
+ask tool approve dedupe   # re-approve after reviewing a hand-edited script
+ask tool rm dedupe        # delete it
+```
+
+In interactive mode the same commands work without quoting: `$dedupe ~/Downloads`,
+`tool list`, and so on. Approved tools are also advertised to the LLM, so a
+prompt like "clean up my downloads" may come back proposing `$dedupe ~/Downloads`
+— such lines always ask for confirmation, even in auto mode.
+
+Safety model: you approve a script's exact source, and its SHA-256 (covering
+the interpreter too) is stored in the manifest. If the file on disk changes in
+any way, `ask` refuses to run it until you review and `tool approve` it again.
+Tool names are restricted to `a-z 0-9 - _`, so they can't escape the tools
+directory.
+
 ## Interactive Mode Features
 
 ### Direct Commands
@@ -348,6 +415,8 @@ confirmation instead, so nothing can chain onto a whitelisted command.
 | `auto on` / `auto off` | Toggle auto mode | Run AI-labeled-safe commands without confirmation |
 | `auto` | Show auto state | Report whether auto mode is on |
 | `model [MODEL]` | Show / switch model | Change the LLM for the session and save as default (`model reset` for built-in) |
+| `tool ...` | Tool library | Create, improve, list, show, approve, or remove saved tools |
+| `$NAME args` | Run a tool | Execute an approved saved tool by name |
 
 ### Auto Mode
 
@@ -482,6 +551,7 @@ Times vary by run due to API latency, but relative rankings are consistent.
 - `ureq` - HTTP client for API requests
 - `rustyline` - Line editing and history in interactive mode
 - `libc` - Terminal input flushing for confirmations
+- `sha2` - Checksums that gate saved-tool execution on approval
 
 ## Building
 

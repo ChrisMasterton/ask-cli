@@ -519,7 +519,7 @@ fn truncate_utf8_bytes_never_splits_a_character() {
 
 #[test]
 fn normal_prompt_requests_state_dependent_commands_as_one_chain() {
-    let prompt = build_prompt("create and enter a directory", None);
+    let prompt = build_prompt("create and enter a directory", None, "");
     assert!(
         prompt
             .contains("Keep state-dependent steps such as `cd` or `export` in one `&&` chain")
@@ -528,9 +528,29 @@ fn normal_prompt_requests_state_dependent_commands_as_one_chain() {
 }
 
 #[test]
+fn normal_prompt_embeds_the_tool_catalog_and_leaves_no_placeholder() {
+    let catalog = "**User tool library**\n- $backup — back up things\n";
+    let prompt = build_prompt("list files", None, catalog);
+    assert!(prompt.contains("- $backup — back up things"));
+    assert!(!prompt.contains("{tool_catalog}"));
+
+    let without = build_prompt("list files", None, "");
+    assert!(!without.contains("{tool_catalog}"));
+    assert!(!without.contains("tool library"));
+}
+
+#[test]
+fn piped_prompt_never_contains_the_tool_catalog() {
+    let catalog = "**User tool library**\n- $backup — back up things\n";
+    let prompt = build_prompt("summarize", Some("some data"), catalog);
+    assert!(!prompt.contains("$backup"));
+    assert!(!prompt.contains("{tool_catalog}"));
+}
+
+#[test]
 fn piped_prompt_includes_request_and_unicode_data_without_panicking() {
     let data = "🚀".repeat((MAX_PIPE_BYTES / 4) + 1);
-    let prompt = build_prompt("summarize", Some(&data));
+    let prompt = build_prompt("summarize", Some(&data), "");
     assert!(prompt.contains("**User request:** summarize"));
     assert!(prompt.contains("truncated"));
     assert!(prompt.contains("---BEGIN PIPED DATA---"));
@@ -708,6 +728,15 @@ fn deny_list_blocks_dangerous_commands_from_auto_execution() {
     for cmd in ["ls -la", "git status", "du -sh * | sort -rh"] {
         assert!(!never_auto_execute(cmd), "safe to auto-run: {cmd}");
     }
+}
+
+#[test]
+fn tool_invocations_never_auto_execute_but_dollar_in_arguments_is_fine() {
+    // The approved checksum covers the script, not the arguments, so a
+    // model-proposed `$tool` line must always be confirmed by hand.
+    assert!(never_auto_execute("$backup docs"));
+    assert!(never_auto_execute("  $ports"));
+    assert!(!never_auto_execute("echo $HOME"));
 }
 
 #[test]

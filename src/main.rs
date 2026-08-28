@@ -11,6 +11,8 @@ use std::process::{Command, Stdio, exit};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+mod tools;
+
 const API_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 const DEFAULT_MODEL: &str = "meta-llama/llama-3.3-70b-instruct";
 // Token limits - most models support 4K-128K, we'll be conservative
@@ -40,6 +42,7 @@ You are a command-line assistant specialized in MacOS Zsh scripting, helping use
 - Assume the user is using **MacOS** **Zsh** unless they specify otherwise
 - Do not use any code blocks (```) in your response
 
+{tool_catalog}
 **Examples:**
 User: How do I kill a process running on port 5234?
 Response:
@@ -128,6 +131,31 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         && let Some(command) = parse_model_command(prompt)
     {
         apply_model_command(command, &theme);
+        return Ok(());
+    }
+
+    // `ask '$name args'` runs an approved saved tool directly — no API call,
+    // so like the config commands above it works without an API key.
+    if let Some(prompt) = &args.prompt
+        && let Some((name, args_tail)) = tools::parse_tool_invocation(prompt)
+    {
+        let root = tools::tools_root().ok_or("HOME is not set; cannot locate ~/.ask/tools.")?;
+        let resolved = tools::resolve_approved_tool(&root, &name, &args_tail)?;
+        println!(
+            "{} {}",
+            theme.prompt_text("run>"),
+            theme.command_text(&resolved)
+        );
+        run_command_with_output(&resolved)?;
+        return Ok(());
+    }
+
+    // `ask tool ...` manages the saved tool library. Only `tool new` and
+    // `tool improve` call the LLM; they read the API key themselves.
+    if let Some(prompt) = &args.prompt
+        && let Some(command) = tools::parse_tool_command(prompt)
+    {
+        tools::handle_tool_command(command, &args.model, &theme)?;
         return Ok(());
     }
 
@@ -395,7 +423,9 @@ fn is_safe_direct_command(cmd: &str) -> bool {
 fn print_banner(theme: &Theme, auto: bool) {
     println!(
         "{}",
-        theme.prompt_text("Interactive mode. Commands: 'exit', 'clear', 'finder', 'auto on|off'")
+        theme.prompt_text(
+            "Interactive mode. Commands: 'exit', 'clear', 'finder', 'auto on|off', 'tool', '$name'"
+        )
     );
     println!(
         "{}",
@@ -569,6 +599,46 @@ fn run_interactive_mode(
                     theme.helper_text("Opened Finder at current directory")
                 ),
                 Err(e) => eprintln!("Failed to open Finder: {}", e),
+            }
+            continue;
+        }
+
+        // `$name args` runs an approved saved tool. This must come before
+        // is_safe_direct_command: `$` is a shell metacharacter, so the line
+        // would otherwise fall through to the LLM.
+        if let Some((name, args_tail)) = tools::parse_tool_invocation(input) {
+            let resolved = tools::tools_root()
+                .ok_or_else(|| "HOME is not set; cannot locate ~/.ask/tools.".to_string())
+                .and_then(|root| tools::resolve_approved_tool(&root, &name, &args_tail));
+            match resolved {
+                Ok(resolved) => {
+                    println!(
+                        "{} {}",
+                        theme.prompt_text("run>"),
+                        theme.command_text(&resolved)
+                    );
+                    match run_command_with_output(&resolved) {
+                        Ok(output) => {
+                            // Store what actually ran so the model sees it.
+                            history.push(ConversationContext {
+                                prompt: input.to_string(),
+                                commands: vec![resolved],
+                                outputs: vec![output],
+                            });
+                            warn_if_context_compacted(&history, theme);
+                        }
+                        Err(e) => eprintln!("Command failed: {e}"),
+                    }
+                }
+                Err(e) => eprintln!("{e}"),
+            }
+            continue;
+        }
+
+        // `tool ...` manages the saved tool library.
+        if let Some(command) = tools::parse_tool_command(input) {
+            if let Err(e) = tools::handle_tool_command(command, &model, theme) {
+                eprintln!("Error: {e}");
             }
             continue;
         }
@@ -757,7 +827,7 @@ fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> (&str, bool) {
     (&value[..end], true)
 }
 
-fn build_prompt(prompt: &str, piped_data: Option<&str>) -> String {
+fn build_prompt(prompt: &str, piped_data: Option<&str>, tool_catalog: &str) -> String {
     if let Some(data) = piped_data {
         let (prefix, was_truncated) = truncate_utf8_bytes(data, MAX_PIPE_BYTES);
         let display_data = if was_truncated {
@@ -765,11 +835,15 @@ fn build_prompt(prompt: &str, piped_data: Option<&str>) -> String {
         } else {
             data.to_string()
         };
+        // No tool catalog in pipe mode: piped data is untrusted context, and
+        // combining it with tool suggestions would stack two injection surfaces.
         PIPE_PROMPT_TEMPLATE
             .replace("{piped_data}", &display_data)
             .replace("{query}", prompt)
     } else {
-        PROMPT_TEMPLATE.replace("{query}", prompt)
+        PROMPT_TEMPLATE
+            .replace("{tool_catalog}", tool_catalog)
+            .replace("{query}", prompt)
     }
 }
 
@@ -795,14 +869,33 @@ fn query_api(
         }));
     }
 
-    // Build the user prompt – use the pipe-aware template when data was piped in.
-    let full_prompt = build_prompt(prompt, piped_data);
+    // Build the user prompt – use the pipe-aware template when data was piped
+    // in. The saved-tool catalog is re-read on every call so tools created
+    // mid-session appear immediately.
+    let tool_catalog = if piped_data.is_none() {
+        tools::tools_root()
+            .map(|root| tools::catalog_block(&root))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let full_prompt = build_prompt(prompt, piped_data, &tool_catalog);
 
     messages.push(json!({
         "role": "user",
         "content": full_prompt
     }));
 
+    commands_from_api_response(call_llm(messages, model, api_key)?)
+}
+
+/// Sends a raw message list to OpenRouter and returns the parsed response.
+/// Shared by the command flow and the tool-library generation prompts.
+fn call_llm(
+    messages: Vec<serde_json::Value>,
+    model: &str,
+    api_key: &str,
+) -> Result<ApiResponse, Box<dyn std::error::Error>> {
     let body = json!({
         "model": model,
         "messages": messages
@@ -820,26 +913,20 @@ fn query_api(
         .set("Content-Type", "application/json")
         .send_json(body);
 
-    let api_response = match response {
-        Ok(resp) => resp.into_json::<ApiResponse>()?,
+    match response {
+        Ok(resp) => Ok(resp.into_json::<ApiResponse>()?),
         Err(ureq::Error::Status(code, resp)) => {
             let text = resp.into_string().unwrap_or_else(|_| String::new());
-            return Err(format!("API error {code}: {text}").into());
+            Err(format!("API error {code}: {text}").into())
         }
-        Err(err) => return Err(format!("Network error: {err}").into()),
-    };
-
-    commands_from_api_response(api_response)
+        Err(err) => Err(format!("Network error: {err}").into()),
+    }
 }
 
 fn commands_from_api_response(
     api_response: ApiResponse,
 ) -> Result<LlmReply, Box<dyn std::error::Error>> {
-    let Some(content) = api_response
-        .choices
-        .first()
-        .map(|choice| choice.message.content.trim())
-    else {
+    let Some(content) = api_response.first_content() else {
         return Err("No command returned from the model.".into());
     };
 
@@ -909,19 +996,37 @@ fn process_prompt_with_context(
     // Auto mode never applies when untrusted piped data is in context — its
     // contents could have coaxed the model into a bogus `SAFE: yes`.
     let auto_execute = auto_mode && reply.safe && piped_data.is_none();
-    execute_commands_with(
-        reply.commands,
-        theme,
-        auto_execute,
-        confirm,
-        run_command_with_output,
-    )
+    execute_commands_with(reply.commands, theme, auto_execute, confirm, run_line)
+}
+
+/// Executes one confirmed line from the model, resolving `$name args` tool
+/// invocations to their approved script first. Ordinary lines run unchanged.
+fn run_line(command: &str) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some((name, args_tail)) = tools::parse_tool_invocation(command) {
+        // The approved checksum covers the script, not the arguments — don't
+        // let a model-written args tail smuggle extra shell along for the ride.
+        if contains_shell_metacharacters(&args_tail) {
+            return Err(format!(
+                "Refusing to run '${name}' with shell metacharacters in its arguments: {args_tail}"
+            )
+            .into());
+        }
+        let root = tools::tools_root().ok_or("HOME is not set; cannot locate ~/.ask/tools.")?;
+        let resolved = tools::resolve_approved_tool(&root, &name, &args_tail)?;
+        return run_command_with_output(&resolved);
+    }
+    run_command_with_output(command)
 }
 
 // Commands that never run without explicit confirmation, even when the model
 // marks its response safe — a backstop against a misjudged or injected
 // `SAFE: yes` verdict.
 fn never_auto_execute(command: &str) -> bool {
+    // LLM-proposed `$tool` invocations always require confirmation — the
+    // approved checksum covers the script, not the arguments it runs with.
+    if command.trim_start().starts_with('$') {
+        return true;
+    }
     const DENY: &[&str] = &[
         "rm", "rmdir", "sudo", "dd", "shutdown", "reboot", "halt", "kill", "killall",
     ];
@@ -1310,6 +1415,21 @@ Auto mode:
   (rm, sudo, dd, kill, ...) always ask for confirmation. The setting is
   remembered between sessions.
 
+Tool library:
+  ask tool new NAME WHAT IT DOES    Have the LLM write a reusable bash/python
+                                    script; you review the source, then approve
+  ask 'tool improve NAME ...'       Update an existing tool (review + approve)
+  ask tool list                     List saved tools
+  ask tool show NAME                Print a tool's source and approval status
+  ask tool approve NAME             Re-approve after reviewing a changed script
+  ask tool rm NAME                  Delete a tool
+  ask '$NAME args'                  Run an approved tool (quote the sigil so
+                                    your shell doesn't expand $NAME first)
+
+  Tools live in ~/.ask/tools/NAME/. Each approval stores a checksum of the
+  script; if the file changes, ask refuses to run it until re-approved.
+  All of these also work inside interactive mode (no quoting needed there).
+
 Pipe mode examples:
   git diff | ask \"write a commit message\"
   cat error.log | ask \"what went wrong?\"
@@ -1330,7 +1450,10 @@ Interactive mode commands:
   finder            Open Finder window at current directory
   auto on|off       Toggle auto-execution of model-labeled-safe commands
   auto              Show whether auto mode is on
-  model [MODEL]     Show or change the saved LLM model (also: model reset)"
+  model [MODEL]     Show or change the saved LLM model (also: model reset)
+  tool ...          Manage the saved tool library (new, improve, list, show,
+                    approve, rm)
+  $NAME args        Run an approved saved tool"
     );
 }
 
@@ -1353,6 +1476,14 @@ impl std::ops::Deref for LlmReply {
 #[derive(Debug, Deserialize)]
 struct ApiResponse {
     choices: Vec<Choice>,
+}
+
+impl ApiResponse {
+    fn first_content(&self) -> Option<&str> {
+        self.choices
+            .first()
+            .map(|choice| choice.message.content.trim())
+    }
 }
 
 #[derive(Debug, Deserialize)]
