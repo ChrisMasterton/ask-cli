@@ -50,10 +50,7 @@ fn parse_confirmation_choice_treats_escaped_yes_as_yes() {
 fn parse_confirmation_choice_supports_all_options() {
     assert_eq!(parse_confirmation_choice("n"), Some(ConfirmChoice::No));
     assert_eq!(parse_confirmation_choice("skip"), Some(ConfirmChoice::Skip));
-    assert_eq!(
-        parse_confirmation_choice("i"),
-        Some(ConfirmChoice::Instruct)
-    );
+    assert_eq!(parse_confirmation_choice("i"), None, "instruct was removed");
     assert_eq!(parse_confirmation_choice("maybe"), None);
 }
 
@@ -68,7 +65,11 @@ fn confirmed_commands_execute_exactly_once_and_comments_never_execute() {
         vec!["# explanation".to_string(), "touch marker".to_string()],
         &theme,
         false,
-        |command, _| {
+        |command, _, offer_skip| {
+            assert!(
+                !offer_skip,
+                "a single executable command must not offer skip"
+            );
             confirmed.push(command.to_string());
             Ok(confirmations.pop_front().expect("confirmation response"))
         },
@@ -104,7 +105,10 @@ fn skip_and_cancel_never_execute_the_rejected_commands() {
         ],
         &theme,
         false,
-        |_, _| Ok(confirmations.pop_front().expect("confirmation response")),
+        |_, _, offer_skip| {
+            assert!(offer_skip, "multiple commands must offer skip");
+            Ok(confirmations.pop_front().expect("confirmation response"))
+        },
         |command| {
             executed.push(command.to_string());
             Ok(format!("output:{command}"))
@@ -126,7 +130,7 @@ fn failed_execution_stops_the_flow_without_claiming_later_commands_ran() {
         vec!["fails".to_string(), "must-not-run".to_string()],
         &theme,
         false,
-        |_, _| Ok(ConfirmResponse::Yes),
+        |_, _, _| Ok(ConfirmResponse::Yes),
         |command| {
             executed.push(command.to_string());
             Err("simulated command failure".into())
@@ -138,29 +142,27 @@ fn failed_execution_stops_the_flow_without_claiming_later_commands_ran() {
 }
 
 #[test]
-fn instruct_runs_custom_command_then_original_once_after_reconfirmation() {
+fn comment_lines_do_not_count_toward_offering_skip() {
     let theme = Theme::from_mode(ThemeMode::Dark);
-    let mut confirmations = VecDeque::from([
-        ConfirmResponse::Instruct("pwd".to_string()),
-        ConfirmResponse::Yes,
-    ]);
-    let mut executed = Vec::new();
+    let mut offers = Vec::new();
 
-    let result = execute_commands_with(
-        vec!["rm old-file".to_string()],
+    execute_commands_with(
+        vec![
+            "# first note".to_string(),
+            "# second note".to_string(),
+            "only-command".to_string(),
+        ],
         &theme,
         false,
-        |_, _| Ok(confirmations.pop_front().expect("confirmation response")),
-        |command| {
-            executed.push(command.to_string());
-            Ok(format!("output:{command}"))
+        |_, _, offer_skip| {
+            offers.push(offer_skip);
+            Ok(ConfirmResponse::Yes)
         },
+        |command| Ok(format!("output:{command}")),
     )
-    .expect("instruct flow should succeed");
+    .expect("comment-heavy flow should succeed");
 
-    assert_eq!(executed, vec!["pwd", "rm old-file"]);
-    assert_eq!(result.0, vec!["rm old-file"]);
-    assert_eq!(result.1, vec!["output:rm old-file"]);
+    assert_eq!(offers, vec![false]);
 }
 
 #[test]
@@ -673,7 +675,7 @@ fn auto_mode_executes_safe_commands_without_confirmation() {
         vec!["# listing files".to_string(), "ls -la".to_string()],
         &theme,
         true,
-        |_, _| -> Result<ConfirmResponse, io::Error> {
+        |_, _, _| -> Result<ConfirmResponse, io::Error> {
             panic!("auto mode must not prompt for a safe command")
         },
         |command| {
@@ -697,7 +699,7 @@ fn auto_mode_still_confirms_denylisted_commands() {
         vec!["rm -rf ./build".to_string()],
         &theme,
         true,
-        |command, _| {
+        |command, _, _| {
             confirmed.push(command.to_string());
             Ok(ConfirmResponse::No)
         },

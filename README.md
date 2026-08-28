@@ -8,32 +8,32 @@ Stop googling shell syntax — just say what you want:
 
 ```bash
 $ ask "kill whatever is using port 3000"
-run> kill $(lsof -t -i :3000)?  [Y/n/s/i]
+run> kill $(lsof -t -i :3000)?  [Y/n]
 
 $ ask "what's eating my disk space?"
-run> du -sh * | sort -rh | head -10?  [Y/n/s/i]
+run> du -sh * | sort -rh | head -10?  [Y/n]
 
 $ ask "find every file over 500MB in my home folder"
-run> find ~ -type f -size +500M 2>/dev/null?  [Y/n/s/i]
+run> find ~ -type f -size +500M 2>/dev/null?  [Y/n]
 
 $ ask "undo my last commit but keep the changes"
-run> git reset --soft HEAD~1?  [Y/n/s/i]
+run> git reset --soft HEAD~1?  [Y/n]
 ```
 
 It knows the Mac-only tools you can never remember:
 
 ```bash
 $ ask "convert all these HEIC photos to jpg"
-run> for f in *.heic; do sips -s format jpeg "$f" --out "${f%.heic}.jpg"; done?  [Y/n/s/i]
+run> for f in *.heic; do sips -s format jpeg "$f" --out "${f%.heic}.jpg"; done?  [Y/n]
 
 $ ask "keep my mac awake for the next 2 hours"
-run> caffeinate -d -t 7200?  [Y/n/s/i]
+run> caffeinate -d -t 7200?  [Y/n]
 
 $ ask "what's my local IP?"
-run> ipconfig getifaddr en0?  [Y/n/s/i]
+run> ipconfig getifaddr en0?  [Y/n]
 
 $ ask "flush the DNS cache"
-run> sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder?  [Y/n/s/i]
+run> sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder?  [Y/n]
 ```
 
 Pipe anything into it — logs, diffs, JSON, clipboard contents:
@@ -50,12 +50,12 @@ And interactive mode keeps context between prompts, so follow-ups just work:
 
 ```
 ask [Downloads]> find dmg files older than a month
-run> find . -name "*.dmg" -mtime +30?  [Y/n/s/i]  y
+run> find . -name "*.dmg" -mtime +30?  [Y/n]  y
 ./OldInstaller.dmg
 ./Slack-4.35.dmg
 
 ask [Downloads]> now delete them
-run> find . -name "*.dmg" -mtime +30 -delete?  [Y/n/s/i]
+run> find . -name "*.dmg" -mtime +30 -delete?  [Y/n]
 ```
 
 Once you trust it, turn on auto mode — commands the AI labels as safe run
@@ -70,7 +70,7 @@ run> find . -name "*.rs" -not -path "./target/*" | xargs wc -l (auto)
     2622 total
 
 $ ask "delete the build cache"
-run> rm -rf target?  [Y/n/s/i]        # destructive → still asks
+run> rm -rf target?  [Y/n]        # destructive → still asks
 ```
 
 When a one-liner isn't enough, have it write you a reusable tool — reviewed
@@ -150,8 +150,7 @@ ask
 - **Improve, Don't Regenerate**: `tool improve <name> <instructions>` updates the existing script
 
 ### Command Execution Options
-- **Skip (s)**: Skip current command and continue to next
-- **Instruct (i)**: Run a custom command first, then return to original
+- **Skip (s)**: Skip one command of a multi-command response and continue to the next
 - **Conversational Responses**: AI can respond without generating commands
 - **Auto Mode**: `auto on` lets commands the AI labels as safe run without
   confirmation — destructive ones still ask (persists across sessions)
@@ -237,7 +236,7 @@ ask [Projects]> cd ask-cli
 run> cd ask-cli
 
 ask [ask-cli]> create a readme file
-run> touch README.md? [Y/n/s/i] y
+run> touch README.md? [Y/n] y
 
 ask [ask-cli]> q
 Goodbye!
@@ -319,16 +318,18 @@ Tool library (only new/improve need the API key):
 
 ### Command Confirmation Options
 
-When a command is presented for confirmation, you have multiple options:
+When a command is presented for confirmation:
 
 ```
-run> command? [Y/n/s/i]
+run> command?  [Y/n]
 
 Y/yes (Enter)     Execute the command
 n/no              Cancel and exit (or return to prompt in interactive mode)
-s/skip            Skip this command, continue to next
-i/instruct        Execute a custom command first, then return to original
 ```
+
+When a response contains several commands, the prompt becomes `[Y/n/s]` —
+`s`/`skip` passes over the current command and continues to the next, while
+`n` cancels the rest of the sequence.
 
 ### Using Custom Models
 
@@ -422,7 +423,7 @@ confirmation instead, so nothing can chain onto a whitelisted command.
 
 Every AI response starts with a safety verdict (`SAFE: yes` / `SAFE: no`)
 judging whether its commands are read-only or destructive. With auto mode on,
-commands the model marks safe run immediately — no `[Y/n/s/i]` prompt:
+commands the model marks safe run immediately — no `[Y/n]` prompt:
 
 ```
 ask [Projects]> how big is this folder?
@@ -479,10 +480,9 @@ ask [Projects]> what did we just do?
 ## Safety Features
 
 - Commands are always shown before execution
-- Multiple confirmation options (Y/n/s/i)
+- Simple confirmation prompt ([Y/n], plus skip for multi-command responses)
   - Return key accepts and runs the operation
-  - Skip option to bypass without exiting
-  - Instruct option to run custom commands first
+  - Skip option to bypass one command without cancelling the rest
 - Safe practices baked into the AI prompt
 - No automatic execution without user approval (unless auto mode is explicitly enabled)
 - Direct execution limited to read-only commands

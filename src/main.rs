@@ -1043,11 +1043,20 @@ fn execute_commands_with<C, E>(
     mut execute_command: E,
 ) -> Result<(Vec<String>, Vec<String>), Box<dyn std::error::Error>>
 where
-    C: FnMut(&str, &Theme) -> Result<ConfirmResponse, io::Error>,
+    C: FnMut(&str, &Theme, bool) -> Result<ConfirmResponse, io::Error>,
     E: FnMut(&str) -> Result<String, Box<dyn std::error::Error>>,
 {
     let mut executed_commands = Vec::new();
     let mut command_outputs = Vec::new();
+
+    // Skip only means something when there is more than one command to skip
+    // between; with a single command it duplicates "no", so the prompt
+    // doesn't offer it.
+    let offer_skip = commands
+        .iter()
+        .filter(|command| !command.starts_with('#'))
+        .count()
+        > 1;
 
     for command in commands {
         if command.starts_with('#') {
@@ -1071,31 +1080,7 @@ where
             continue;
         }
 
-        // Resolve at most one instruct round, then act on the final response.
-        let response = match confirm_command(&command, theme)? {
-            ConfirmResponse::Instruct(custom_command) => {
-                if !custom_command.is_empty() {
-                    println!(
-                        "Running custom command: {}",
-                        theme.command_text(&custom_command)
-                    );
-                    execute_command(&custom_command)?;
-                }
-                // After running custom command, continue with the original flow
-                println!("\nReturning to original command:");
-                match confirm_command(&command, theme)? {
-                    ConfirmResponse::Instruct(_) => {
-                        // Don't allow nested instruct for simplicity
-                        println!("Nested instruct not allowed. Skipping command.");
-                        continue;
-                    }
-                    other => other,
-                }
-            }
-            other => other,
-        };
-
-        match response {
+        match confirm_command(&command, theme, offer_skip)? {
             ConfirmResponse::Yes => {
                 let output = execute_command(&command)?;
                 executed_commands.push(command.clone());
@@ -1108,17 +1093,21 @@ where
             ConfirmResponse::Skip => {
                 println!("Skipping command: {}", theme.command_text(&command));
             }
-            ConfirmResponse::Instruct(_) => unreachable!("instruct is resolved above"),
         }
     }
 
     Ok((executed_commands, command_outputs))
 }
 
-fn confirm(command: &str, theme: &Theme) -> Result<ConfirmResponse, io::Error> {
+fn confirm(command: &str, theme: &Theme, offer_skip: bool) -> Result<ConfirmResponse, io::Error> {
+    let (options, invalid_hint) = if offer_skip {
+        ("[Y/n/s]", "Please use Y(es), n(o), or s(kip).")
+    } else {
+        ("[Y/n]", "Please use Y(es) or n(o).")
+    };
     loop {
         print!(
-            "{} {}?  [Y/n/s/i]  ",
+            "{} {}?  {options}  ",
             theme.prompt_text("run>"),
             theme.command_text(command)
         );
@@ -1129,15 +1118,11 @@ fn confirm(command: &str, theme: &Theme) -> Result<ConfirmResponse, io::Error> {
         match parse_confirmation_choice(&input) {
             Some(ConfirmChoice::Yes) => return Ok(ConfirmResponse::Yes),
             Some(ConfirmChoice::No) => return Ok(ConfirmResponse::No),
+            // `s` is still accepted when unadvertised — with one command it
+            // just behaves like "no" without the cancelled message.
             Some(ConfirmChoice::Skip) => return Ok(ConfirmResponse::Skip),
-            Some(ConfirmChoice::Instruct) => {
-                print!("{} ", theme.prompt_text("enter>"));
-                io::stdout().flush()?;
-                let custom_command = read_confirmation_line()?;
-                return Ok(ConfirmResponse::Instruct(custom_command.trim().to_string()));
-            }
             None => {
-                println!("Invalid response. Please use Y(es), n(o), s(kip), or i(nstruct).");
+                println!("Invalid response. {invalid_hint}");
             }
         }
     }
@@ -1150,7 +1135,6 @@ fn parse_confirmation_choice(input: &str) -> Option<ConfirmChoice> {
         "" | "y" | "yes" => Some(ConfirmChoice::Yes),
         "n" | "no" => Some(ConfirmChoice::No),
         "s" | "skip" => Some(ConfirmChoice::Skip),
-        "i" | "instruct" => Some(ConfirmChoice::Instruct),
         _ => None,
     }
 }
@@ -1410,7 +1394,7 @@ Auto mode:
   ask auto on / ask auto off (also works inside interactive mode)
 
   The model labels each response safe or destructive. When auto mode is ON,
-  commands labeled safe run immediately without the [Y/n/s/i] prompt.
+  commands labeled safe run immediately without the [Y/n] prompt.
   Destructive or unlabeled commands, piped-data sessions, and a deny-list
   (rm, sudo, dd, kill, ...) always ask for confirmation. The setting is
   remembered between sessions.
@@ -1442,7 +1426,7 @@ Command confirmation options:
   Y/yes (or Enter)  Execute the command
   n/no              Cancel execution and exit (in interactive mode, returns to prompt)
   s/skip            Skip this command and continue to the next
-  i/instruct        Execute a custom command first, then return to the original
+                    (offered only when the response has multiple commands)
 
 Interactive mode commands:
   exit / quit       Exit interactive mode
@@ -1500,7 +1484,6 @@ enum ConfirmResponse {
     Yes,
     No,
     Skip,
-    Instruct(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1508,7 +1491,6 @@ enum ConfirmChoice {
     Yes,
     No,
     Skip,
-    Instruct,
 }
 
 #[derive(Clone)]
