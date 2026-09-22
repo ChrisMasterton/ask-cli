@@ -83,11 +83,35 @@ Every generated command is shown before it runs: `Enter`/`y` executes, `n`
 cancels. When a response contains several commands the prompt becomes
 `[Y/n/s]`, where `s` skips just the current one.
 
-Once you trust it, `ask auto on` lets commands the model labels as safe
-(`SAFE: yes`, its verdict on every response) run without the prompt.
-Destructive or unlabeled commands, a built-in deny-list (`rm`, `sudo`, `dd`,
-`kill`, ...), piped-data sessions, and `$tool` lines always still ask. The
-setting persists; `ask auto off` turns it back off.
+`ask auto on` uses **Jev** to independently assess each eligible generated
+command through OpenRouter, using your existing `OPENROUTER_ASK_API_KEY`.
+Commands confidently assessed as read-only run without the prompt. Fresh checks
+are additional API requests; they send only the command and shell type.
+
+Confident read-only assessments are cached for seven days in
+`~/.ask/jev-cache.json`, with a maximum of 512 entries. Exact command text,
+the assessment prompt/model/thresholds, and the current directory, shell and
+PATH contribute to a SHA-256 key. Only hashes, scores and timestamps are saved;
+command text and API keys are not stored in the cache. Repeat commands with a
+valid cache entry skip the Jev request. Local restrictions still apply on every
+run. Uncertain or failed assessments are not cached; damaged or expired entries
+trigger a fresh check. Delete the cache file to clear it.
+
+Local policy limits this to supported inspection commands such as `ls`, `du`,
+`ps`, `grep`, and `git status`. Writes, unknown programs, scripts, complex
+shell syntax (including pipelines, quotes, and redirections), piped-data
+sessions, and `$tool` lines still ask. Uncertain, malformed, or unavailable
+assessments also fall back to confirmation, with a five-second request timeout.
+Auto mode defaults to off; the setting persists, and `ask auto off` disables it.
+
+Jev's confidence is evidence, not a guarantee. The current conservative cutoff
+requires both read-only probability and confidence of at least 0.99. The
+[classification fixture](tests/fixtures/command-safety.json) includes ordinary
+reads, writes, hidden side effects, scripts, and injected instructions. Run
+`cargo test live_jev_safety_evaluation -- --ignored --nocapture` to evaluate
+the live model without executing any fixture commands. The integration uses
+[OpenRouter's Decisions API](https://openrouter.ai/labs/jev/compile) and
+[TypeSafe's Choice response format](https://docs.typesafe.ai/primitives/choice).
 
 ### Tool Library
 
@@ -133,8 +157,12 @@ destructive flags goes through review instead. Handy extras:
 | `tool ...`, `$NAME args` | Tool library management and execution |
 
 The session keeps conversation history as LLM context (auto-compacted as it
-grows), and the model can answer questions conversationally — replies
-prefixed with `#` are commentary, not commands.
+grows), including answers, command outcomes, and visible terminal output.
+If a command fails, the next prompt includes its error and any earlier
+successful steps. Skipped, cancelled, and unrun commands are recorded as such.
+Long output is trimmed from the beginning to retain final diagnostics; terminal
+capture stays in memory. The model can also answer questions conversationally —
+replies prefixed with `#` are commentary, not commands.
 
 ## Configuration
 

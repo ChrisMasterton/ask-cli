@@ -64,7 +64,7 @@ fn confirmed_commands_execute_exactly_once_and_comments_never_execute() {
     let result = execute_commands_with(
         vec!["# explanation".to_string(), "touch marker".to_string()],
         &theme,
-        false,
+        |_| false,
         |command, _, offer_skip| {
             assert!(
                 !offer_skip,
@@ -77,13 +77,14 @@ fn confirmed_commands_execute_exactly_once_and_comments_never_execute() {
             executed.push(command.to_string());
             Ok("created marker".to_string())
         },
-    )
-    .expect("command flow should succeed");
+    );
 
     assert_eq!(confirmed, vec!["touch marker"]);
     assert_eq!(executed, vec!["touch marker"]);
-    assert_eq!(result.0, vec!["touch marker"]);
-    assert_eq!(result.1, vec!["created marker"]);
+    assert_eq!(result.outcomes[0].status, CommandStatus::Comment);
+    assert_eq!(result.outcomes[1].status, CommandStatus::Succeeded);
+    assert_eq!(result.outcomes[1].command, "touch marker");
+    assert_eq!(result.outcomes[1].output, "created marker");
 }
 
 #[test]
@@ -104,7 +105,7 @@ fn skip_and_cancel_never_execute_the_rejected_commands() {
             "never-reached".to_string(),
         ],
         &theme,
-        false,
+        |_| false,
         |_, _, offer_skip| {
             assert!(offer_skip, "multiple commands must offer skip");
             Ok(confirmations.pop_front().expect("confirmation response"))
@@ -113,12 +114,19 @@ fn skip_and_cancel_never_execute_the_rejected_commands() {
             executed.push(command.to_string());
             Ok(format!("output:{command}"))
         },
-    )
-    .expect("skip/cancel flow should succeed");
+    );
 
     assert_eq!(executed, vec!["run-me"]);
-    assert_eq!(result.0, vec!["run-me"]);
-    assert_eq!(result.1, vec!["output:run-me"]);
+    assert_eq!(
+        result.outcomes.iter().map(|o| o.status).collect::<Vec<_>>(),
+        vec![
+            CommandStatus::Skipped,
+            CommandStatus::Succeeded,
+            CommandStatus::Cancelled,
+            CommandStatus::NotRun
+        ]
+    );
+    assert_eq!(result.outcomes[1].output, "output:run-me");
 }
 
 #[test]
@@ -129,7 +137,7 @@ fn failed_execution_stops_the_flow_without_claiming_later_commands_ran() {
     let result = execute_commands_with(
         vec!["fails".to_string(), "must-not-run".to_string()],
         &theme,
-        false,
+        |_| false,
         |_, _, _| Ok(ConfirmResponse::Yes),
         |command| {
             executed.push(command.to_string());
@@ -137,7 +145,8 @@ fn failed_execution_stops_the_flow_without_claiming_later_commands_ran() {
         },
     );
 
-    assert!(result.is_err());
+    assert_eq!(result.error(), Some("simulated command failure"));
+    assert_eq!(result.outcomes[1].status, CommandStatus::NotRun);
     assert_eq!(executed, vec!["fails"]);
 }
 
@@ -153,14 +162,13 @@ fn comment_lines_do_not_count_toward_offering_skip() {
             "only-command".to_string(),
         ],
         &theme,
-        false,
+        |_| false,
         |_, _, offer_skip| {
             offers.push(offer_skip);
             Ok(ConfirmResponse::Yes)
         },
         |command| Ok(format!("output:{command}")),
-    )
-    .expect("comment-heavy flow should succeed");
+    );
 
     assert_eq!(offers, vec![false]);
 }
@@ -264,10 +272,166 @@ fn command_execution_preserves_and_and_short_circuiting() {
 
 #[test]
 fn command_execution_returns_stdout_and_stderr_for_history() {
+    let _lock = CURRENT_DIR_TEST_LOCK.lock().unwrap();
     let output =
         run_command_with_output("printf out; printf err >&2").expect("command should execute");
     assert!(output.contains("out"));
     assert!(output.contains("err"));
+}
+
+#[test]
+fn failed_command_retains_visible_error_for_history() {
+    let _lock = CURRENT_DIR_TEST_LOCK.lock().unwrap();
+    let error = run_command_with_output("printf 'missing widget configuration\\n' >&2; exit 7")
+        .expect_err("command must fail");
+    assert!(error.to_string().contains("missing widget configuration"));
+}
+
+#[test]
+fn terminal_command_retains_visible_output_for_history() {
+    let _lock = CURRENT_DIR_TEST_LOCK.lock().unwrap();
+    // Run this test under a PTY as well as with cargo's usual pipes.
+    let output = run_command_with_output("printf 'terminal diagnostic\\n' >&2")
+        .expect("command should succeed");
+    assert!(output.contains("terminal diagnostic"));
+}
+
+#[test]
+fn partial_failure_and_final_diagnostic_reach_next_turn_context() {
+    let _lock = CURRENT_DIR_TEST_LOCK.lock().unwrap();
+    let theme = Theme::from_mode(ThemeMode::Dark);
+    let mut executed = Vec::new();
+    let report = execute_commands_with(
+        vec![
+            "printf 'step one done\\n'".to_string(),
+            "printf '%5000s' ''; printf 'missing widget configuration\\n' >&2; exit 7".to_string(),
+            "must-not-run".to_string(),
+        ],
+        &theme,
+        |_| false,
+        |_, _, _| Ok(ConfirmResponse::Yes),
+        |command| {
+            executed.push(command.to_string());
+            run_command_with_output(command)
+        },
+    );
+    assert_eq!(executed.len(), 2);
+    assert!(
+        report
+            .error()
+            .unwrap()
+            .contains("missing widget configuration")
+    );
+    let context = compact_history(&[ConversationContext {
+        prompt: "do the three steps".to_string(),
+        outcomes: report.outcomes,
+    }]);
+    assert!(context.contains("step one done\n"));
+    assert!(context.contains("Status: succeeded"));
+    assert!(context.contains("Status: failed"));
+    assert!(context.contains("missing widget configuration\n"));
+    assert!(context.contains("Command exited with status exit status: 7"));
+    assert!(context.contains("Command: must-not-run\nStatus: not executed"));
+    assert!(context.contains("earlier output truncated"));
+}
+
+#[test]
+fn confirmation_failure_preserves_success_and_marks_unrun_commands() {
+    let mut confirmations = 0;
+    let report = execute_commands_with(
+        vec!["first".into(), "second".into(), "third".into()],
+        &Theme::from_mode(ThemeMode::Dark),
+        |_| false,
+        |_, _, _| {
+            confirmations += 1;
+            if confirmations == 1 {
+                Ok(ConfirmResponse::Yes)
+            } else {
+                Err(io::Error::other("terminal disconnected"))
+            }
+        },
+        |_| Ok("first completed".to_string()),
+    );
+    assert_eq!(confirmations, 2);
+    assert_eq!(report.error(), Some("terminal disconnected"));
+    assert_eq!(
+        report.outcomes.iter().map(|o| o.status).collect::<Vec<_>>(),
+        vec![
+            CommandStatus::Succeeded,
+            CommandStatus::ConfirmationFailed,
+            CommandStatus::NotRun
+        ]
+    );
+    assert_eq!(report.outcomes[0].output, "first completed");
+}
+
+#[test]
+fn conversational_answers_remain_available_to_followups() {
+    let report = execute_commands_with(
+        vec![
+            "# Option one is a disk usage summary.".into(),
+            "# Option two lists files.".into(),
+        ],
+        &Theme::from_mode(ThemeMode::Dark),
+        |_| false,
+        |_, _, _| panic!("comments must not prompt"),
+        |_| panic!("comments must not execute"),
+    );
+    let context = compact_history(&[ConversationContext {
+        prompt: "what are my options?".into(),
+        outcomes: report.outcomes,
+    }]);
+    assert!(context.contains("Assistant: Option one is a disk usage summary."));
+    assert!(context.contains("Assistant: Option two lists files."));
+    assert!(!context.contains("Command:"));
+}
+
+#[test]
+fn terminal_control_sequences_do_not_obscure_history() {
+    assert_eq!(
+        clean_terminal_output("\x1b[31mError\x1b[0m: café\r\n\x1b]0;title\x07details\rnext"),
+        "Error: café\ndetails\nnext"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn real_terminal_capture_regression() {
+    // A child test process inside `script` exercises is_terminal() even when
+    // cargo itself is running with redirected streams in CI.
+    if env::var_os("ASK_TEST_TERMINAL_CHILD").is_some() {
+        assert!(
+            io::stdin().is_terminal() && io::stdout().is_terminal() && io::stderr().is_terminal()
+        );
+        let output = run_command_with_output(
+            "test -t 0 && test -t 1 && test -t 2 && printf 'all streams are terminals\\n'",
+        )
+        .unwrap();
+        assert!(output.contains("all streams are terminals"));
+        terminal_command_retains_visible_output_for_history();
+        failed_command_retains_visible_error_for_history();
+        partial_failure_and_final_diagnostic_reach_next_turn_context();
+        return;
+    }
+    let _lock = CURRENT_DIR_TEST_LOCK.lock().unwrap();
+    let result = Command::new("/usr/bin/script")
+        .args(["-q", "/dev/null"])
+        .arg(env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "tests::real_terminal_capture_regression",
+            "--nocapture",
+        ])
+        .env("ASK_TEST_TERMINAL_CHILD", "1")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "PTY regression failed: {} {}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
 }
 
 fn shell_quote(path: &std::path::Path) -> String {
@@ -499,15 +663,14 @@ fn estimate_tokens_uses_four_chars_per_token() {
 }
 
 #[test]
-fn estimate_context_tokens_caps_each_output_at_500_chars() {
+fn estimate_context_tokens_matches_rendered_history() {
     let history = vec![ConversationContext {
-        prompt: "abcde".to_string(),       // 5
-        commands: vec!["xyz".to_string()], // 3
-        outputs: vec!["o".repeat(1000)],   // capped at 500
+        prompt: "abcde".to_string(),
+        outcomes: vec![CommandOutcome::succeeded("xyz", "o".repeat(10000))],
     }];
     assert_eq!(
         estimate_context_tokens(&history),
-        (5 + 3 + 500) / TOKEN_ESTIMATE_RATIO
+        estimate_tokens(&history[0].render())
     );
 }
 
@@ -589,7 +752,6 @@ fn api_response_is_parsed_into_comments_and_intact_shell_lines() {
         reply.commands,
         vec!["# Set up the repo", "mkdir app && cd app && git init"]
     );
-    assert!(!reply.safe);
 }
 
 // --- safety verdict and auto mode ---
@@ -627,7 +789,7 @@ fn missing_or_malformed_marker_yields_no_verdict() {
 }
 
 #[test]
-fn reply_without_verdict_defaults_to_requiring_confirmation() {
+fn reply_without_legacy_verdict_still_parses() {
     let reply = commands_from_api_response(ApiResponse {
         choices: vec![Choice {
             message: Message {
@@ -636,11 +798,11 @@ fn reply_without_verdict_defaults_to_requiring_confirmation() {
         }],
     })
     .expect("valid response");
-    assert!(!reply.safe, "a missing verdict must be treated as unsafe");
+    assert_eq!(reply.commands, vec!["mkdir app"]);
 }
 
 #[test]
-fn verdict_yes_marks_reply_safe() {
+fn legacy_verdict_is_removed_from_command_proposals() {
     let reply = commands_from_api_response(ApiResponse {
         choices: vec![Choice {
             message: Message {
@@ -649,12 +811,11 @@ fn verdict_yes_marks_reply_safe() {
         }],
     })
     .expect("valid response");
-    assert!(reply.safe);
     assert_eq!(reply.commands, vec!["ls -la"]);
 }
 
 #[test]
-fn conversational_reply_without_commands_is_always_safe() {
+fn conversational_reply_keeps_comment_lines() {
     let reply = commands_from_api_response(ApiResponse {
         choices: vec![Choice {
             message: Message {
@@ -663,7 +824,7 @@ fn conversational_reply_without_commands_is_always_safe() {
         }],
     })
     .expect("valid response");
-    assert!(reply.safe, "a reply with no commands defaults to safe");
+    assert_eq!(reply.commands, vec!["# hello there!"]);
 }
 
 #[test]
@@ -674,7 +835,7 @@ fn auto_mode_executes_safe_commands_without_confirmation() {
     let result = execute_commands_with(
         vec!["# listing files".to_string(), "ls -la".to_string()],
         &theme,
-        true,
+        |_| true,
         |_, _, _| -> Result<ConfirmResponse, io::Error> {
             panic!("auto mode must not prompt for a safe command")
         },
@@ -682,11 +843,11 @@ fn auto_mode_executes_safe_commands_without_confirmation() {
             executed.push(command.to_string());
             Ok("ok".to_string())
         },
-    )
-    .expect("auto flow should succeed");
+    );
 
     assert_eq!(executed, vec!["ls -la"]);
-    assert_eq!(result.0, vec!["ls -la"]);
+    assert_eq!(result.outcomes[1].command, "ls -la");
+    assert_eq!(result.outcomes[1].status, CommandStatus::Succeeded);
 }
 
 #[test]
@@ -698,7 +859,7 @@ fn auto_mode_still_confirms_denylisted_commands() {
     let result = execute_commands_with(
         vec!["rm -rf ./build".to_string()],
         &theme,
-        true,
+        |_| true,
         |command, _, _| {
             confirmed.push(command.to_string());
             Ok(ConfirmResponse::No)
@@ -707,12 +868,40 @@ fn auto_mode_still_confirms_denylisted_commands() {
             executed.push(command.to_string());
             Ok(String::new())
         },
-    )
-    .expect("deny-listed flow should succeed");
+    );
 
     assert_eq!(confirmed, vec!["rm -rf ./build"]);
     assert!(executed.is_empty());
-    assert!(result.0.is_empty());
+    assert_eq!(result.outcomes[0].status, CommandStatus::Cancelled);
+}
+
+#[test]
+fn auto_assessment_is_per_command_and_cannot_override_local_policy() {
+    let mut assessed = Vec::new();
+    let mut confirmed = Vec::new();
+    let mut executed = Vec::new();
+    let report = execute_commands_with(
+        vec!["# inspection followed by a write".into(), "ls -la".into(),
+            "du -sh .".into(), "git reset --hard".into()],
+        &Theme::from_mode(ThemeMode::Dark),
+        |command| {
+            assessed.push(command.to_string());
+            command == "ls -la" // Simulate a confident read and an uncertain read.
+        },
+        |command, _, _| {
+            confirmed.push(command.to_string());
+            Ok(ConfirmResponse::Skip)
+        },
+        |command| {
+            executed.push(command.to_string());
+            Ok("listing".into())
+        },
+    );
+    assert_eq!(assessed, vec!["ls -la", "du -sh ."]);
+    assert_eq!(confirmed, vec!["du -sh .", "git reset --hard"]);
+    assert_eq!(executed, vec!["ls -la"]);
+    assert_eq!(report.outcomes[1].status, CommandStatus::Succeeded);
+    assert_eq!(report.outcomes[3].status, CommandStatus::Skipped);
 }
 
 #[test]
@@ -727,18 +916,18 @@ fn deny_list_blocks_dangerous_commands_from_auto_execution() {
     ] {
         assert!(never_auto_execute(cmd), "must never auto-run: {cmd}");
     }
-    for cmd in ["ls -la", "git status", "du -sh * | sort -rh"] {
+    for cmd in ["ls -la", "git status", "du -sh ."] {
         assert!(!never_auto_execute(cmd), "safe to auto-run: {cmd}");
     }
 }
 
 #[test]
-fn tool_invocations_never_auto_execute_but_dollar_in_arguments_is_fine() {
+fn tool_invocations_and_shell_expansions_require_confirmation() {
     // The approved checksum covers the script, not the arguments, so a
     // model-proposed `$tool` line must always be confirmed by hand.
     assert!(never_auto_execute("$backup docs"));
     assert!(never_auto_execute("  $ports"));
-    assert!(!never_auto_execute("echo $HOME"));
+    assert!(never_auto_execute("echo $HOME"));
 }
 
 #[test]
@@ -799,13 +988,11 @@ fn compact_history_keeps_chronological_order_for_small_history() {
     let history = vec![
         ConversationContext {
             prompt: "first-prompt".to_string(),
-            commands: vec!["ls".to_string()],
-            outputs: vec![],
+            outcomes: vec![CommandOutcome::succeeded("ls", String::new())],
         },
         ConversationContext {
             prompt: "second-prompt".to_string(),
-            commands: vec!["pwd".to_string()],
-            outputs: vec![],
+            outcomes: vec![CommandOutcome::succeeded("pwd", String::new())],
         },
     ];
     let out = compact_history(&history);
@@ -820,8 +1007,7 @@ fn compact_history_truncates_when_over_token_budget() {
     let history: Vec<ConversationContext> = (0..40)
         .map(|_| ConversationContext {
             prompt: "p".repeat(1000),
-            commands: vec![],
-            outputs: vec![],
+            outcomes: vec![],
         })
         .collect();
     let out = compact_history(&history);
@@ -839,13 +1025,15 @@ fn compact_history_truncates_when_over_token_budget() {
 fn compact_history_handles_unicode_at_the_truncation_boundary() {
     let history = vec![ConversationContext {
         prompt: "show output".to_string(),
-        commands: vec!["printf".to_string()],
-        outputs: vec!["a".repeat(199) + "🚀" + &"b".repeat(20)],
+        outcomes: vec![CommandOutcome::succeeded(
+            "printf",
+            "a".repeat(100) + "🚀" + &"b".repeat(MAX_HISTORY_OUTPUT_BYTES - 1),
+        )],
     }];
 
     let compacted = compact_history(&history);
 
-    assert!(compacted.contains("... (truncated)"));
+    assert!(compacted.contains("earlier output truncated"));
 }
 
 // --- ThemeMode ---

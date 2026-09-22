@@ -11,6 +11,7 @@ use std::process::{Command, Stdio, exit};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+mod safety;
 mod tools;
 
 const API_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
@@ -18,6 +19,8 @@ const DEFAULT_MODEL: &str = "meta-llama/llama-3.3-70b-instruct";
 // Token limits - most models support 4K-128K, we'll be conservative
 const MAX_CONTEXT_TOKENS: usize = 3000; // Reserve ~1000 for response
 const TOKEN_ESTIMATE_RATIO: usize = 4; // Roughly 1 token per 4 characters
+const MAX_CAPTURE_BYTES: usize = 64 * 1024; // Keep recent command output, including final errors
+const MAX_HISTORY_OUTPUT_BYTES: usize = 4000;
 const MAX_PIPE_BYTES: usize = 64 * 1024; // 64 KB max piped input to keep context reasonable
 static NEXT_CWD_CAPTURE_ID: AtomicU64 = AtomicU64::new(0);
 const PROMPT_TEMPLATE: &str = r#"
@@ -25,10 +28,8 @@ You are a command-line assistant specialized in MacOS Zsh scripting, helping use
 
 **Instructions:**
 - Analyze if the user is requesting an action/command or making a statement/asking a question
-- The FIRST line of every response must be a safety verdict: `SAFE: yes` or `SAFE: no`
-  - `SAFE: yes` — every command is read-only or trivially reversible (listing, viewing, navigating, querying status)
-  - `SAFE: no` — any command modifies, deletes, moves or overwrites files or data, kills processes, installs software, or changes system or git state
-  - If the response contains no commands at all, use `SAFE: yes`
+- Address each part of the request, including requests that combine a question with an action.
+- Use recorded command statuses and output for follow-ups. A proposal is not execution, and a failed command may have partial effects. Do not repeat successful steps without a reason.
 - For ACTION REQUESTS: Generate the appropriate terminal commands
   - Return **only the command**, unless explicitly asked to explain
   - Use **safe practices** (avoid dangerous commands like `rm -rf /`)
@@ -46,18 +47,15 @@ You are a command-line assistant specialized in MacOS Zsh scripting, helping use
 **Examples:**
 User: How do I kill a process running on port 5234?
 Response:
-  SAFE: no
   lsof -i :5234
   kill $(lsof -t -i :5234)
 
 User: this is a great tool
 Response:
-  SAFE: yes
   # Thank you! I'm glad you're finding it helpful. Feel free to ask me to run any commands or questions you have.
 
 User: what did we just do?
 Response:
-  SAFE: yes
   # We just [explain the previous actions based on context]. Is there anything else you'd like to do?
 
 **User request:** {query}
@@ -74,7 +72,6 @@ The user has piped the following data to you via stdin:
 
 **Instructions:**
 - The user's request relates to the piped data above
-- The FIRST line of every response must be `SAFE: yes` (no commands, or only read-only commands) or `SAFE: no` (any command that could modify or delete data)
 - If the user asks you to analyze, summarize, filter, transform, or explain the data, respond conversationally (prefix lines with `# `)
 - If the user asks you to generate a command that processes data like this, return the command
 - If no specific request is given, provide a brief, useful summary of the data (prefix with `# `)
@@ -215,7 +212,7 @@ fn set_auto_mode(enabled: bool, theme: &Theme) {
 
 fn auto_mode_description(enabled: bool) -> &'static str {
     if enabled {
-        "Auto mode ON — commands the model marks as safe run without confirmation"
+        "Auto mode ON — eligible commands Jev confidently assesses as read-only run without confirmation"
     } else {
         "Auto mode OFF — every generated command asks for confirmation"
     }
@@ -530,8 +527,7 @@ fn run_interactive_mode(
             // Add to history
             history.push(ConversationContext {
                 prompt: "pwd".to_string(),
-                commands: vec!["pwd".to_string()],
-                outputs: vec![cwd],
+                outcomes: vec![CommandOutcome::succeeded("pwd", cwd)],
             });
             continue;
         }
@@ -556,8 +552,10 @@ fn run_interactive_mode(
                     // Add to history
                     history.push(ConversationContext {
                         prompt: "cd ..".to_string(),
-                        commands: vec!["cd ..".to_string()],
-                        outputs: vec![format!("Changed to: {}", cwd)],
+                        outcomes: vec![CommandOutcome::succeeded(
+                            "cd ..",
+                            format!("Changed to: {}", cwd),
+                        )],
                     });
                 }
                 Err(e) => {
@@ -617,18 +615,14 @@ fn run_interactive_mode(
                         theme.prompt_text("run>"),
                         theme.command_text(&resolved)
                     );
-                    match run_command_with_output(&resolved) {
-                        Ok(output) => {
-                            // Store what actually ran so the model sees it.
-                            history.push(ConversationContext {
-                                prompt: input.to_string(),
-                                commands: vec![resolved],
-                                outputs: vec![output],
-                            });
-                            warn_if_context_compacted(&history, theme);
-                        }
-                        Err(e) => eprintln!("Command failed: {e}"),
-                    }
+                    let outcome =
+                        CommandOutcome::from_result(&resolved, run_command_with_output(&resolved));
+                    outcome.print_failure();
+                    history.push(ConversationContext {
+                        prompt: input.to_string(),
+                        outcomes: vec![outcome],
+                    });
+                    warn_if_context_compacted(&history, theme);
                 }
                 Err(e) => eprintln!("{e}"),
             }
@@ -665,19 +659,15 @@ fn run_interactive_mode(
                 theme.command_text(&command_to_run)
             );
 
-            match run_command_with_output(&command_to_run) {
-                Ok(output) => {
-                    // Add to history - store what was actually executed
-                    history.push(ConversationContext {
-                        prompt: input.to_string(),
-                        commands: vec![command_to_run.clone()],
-                        outputs: vec![output],
-                    });
-                }
-                Err(e) => {
-                    eprintln!("Command failed: {}", e);
-                }
-            }
+            let outcome = CommandOutcome::from_result(
+                &command_to_run,
+                run_command_with_output(&command_to_run),
+            );
+            outcome.print_failure();
+            history.push(ConversationContext {
+                prompt: input.to_string(),
+                outcomes: vec![outcome],
+            });
 
             warn_if_context_compacted(&history, theme);
 
@@ -685,12 +675,10 @@ fn run_interactive_mode(
         }
 
         match process_prompt_with_context(input, &model, api_key, theme, &history, None, auto) {
-            Ok((commands, outputs)) => {
-                // Add to history
+            Ok(report) => {
                 history.push(ConversationContext {
                     prompt: input.to_string(),
-                    commands: commands.clone(),
-                    outputs,
+                    outcomes: report.outcomes,
                 });
 
                 warn_if_context_compacted(&history, theme);
@@ -716,7 +704,11 @@ fn process_prompt(
     auto_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let starting_dir = env::current_dir().ok();
-    process_prompt_with_context(prompt, model, api_key, theme, &[], piped_data, auto_mode)?;
+    let report =
+        process_prompt_with_context(prompt, model, api_key, theme, &[], piped_data, auto_mode)?;
+    if let Some(error) = report.error() {
+        return Err(error.into());
+    }
     if let (Some(starting_dir), Ok(final_dir)) = (starting_dir, env::current_dir())
         && starting_dir != final_dir
     {
@@ -737,17 +729,10 @@ fn estimate_tokens(text: &str) -> usize {
 }
 
 fn estimate_context_tokens(history: &[ConversationContext]) -> usize {
-    let mut total_chars = 0;
-    for ctx in history {
-        total_chars += ctx.prompt.len();
-        for cmd in &ctx.commands {
-            total_chars += cmd.len();
-        }
-        for output in &ctx.outputs {
-            total_chars += output.len().min(500); // Count truncated size
-        }
-    }
-    total_chars / TOKEN_ESTIMATE_RATIO
+    history
+        .iter()
+        .map(|ctx| estimate_tokens(&ctx.render()))
+        .sum()
 }
 
 fn warn_if_context_compacted(history: &[ConversationContext], theme: &Theme) {
@@ -768,23 +753,7 @@ fn compact_history(history: &[ConversationContext]) -> String {
 
     // Start from most recent and work backwards
     for ctx in history.iter().rev() {
-        let mut ctx_str = format!("User: {}\n", ctx.prompt);
-        for cmd in &ctx.commands {
-            ctx_str.push_str(&format!("Command: {}\n", cmd));
-        }
-        for output in &ctx.outputs {
-            if !output.is_empty() {
-                // Truncate very long outputs more aggressively when compacting
-                let (prefix, was_truncated) = truncate_utf8_bytes(output, 200);
-                let truncated = if was_truncated {
-                    format!("{prefix}... (truncated)")
-                } else {
-                    output.clone()
-                };
-                ctx_str.push_str(&format!("Output: {}\n", truncated));
-            }
-        }
-        ctx_str.push('\n');
+        let ctx_str = ctx.render();
 
         let ctx_tokens = estimate_tokens(&ctx_str);
         if total_tokens + ctx_tokens > MAX_CONTEXT_TOKENS {
@@ -847,8 +816,7 @@ fn build_prompt(prompt: &str, piped_data: Option<&str>, tool_catalog: &str) -> S
     }
 }
 
-/// Send a prompt to the LLM and return the parsed response lines plus the
-/// model's safety verdict.
+/// Send a prompt to the LLM and return the parsed command proposals.
 /// This is the core API call logic, separated from UI concerns for testability.
 fn query_api(
     prompt: &str,
@@ -930,25 +898,18 @@ fn commands_from_api_response(
         return Err("No command returned from the model.".into());
     };
 
-    let (verdict, content) = extract_safety_marker(content);
+    let (_, content) = extract_safety_marker(content);
     let commands = parse_commands(&content);
 
     if commands.is_empty() {
         return Err("No response returned from the model.".into());
     }
 
-    // A response with no executable lines is trivially safe. Otherwise a
-    // missing or malformed verdict means we must assume destructive.
-    let safe = if commands.iter().all(|line| line.starts_with('#')) {
-        true
-    } else {
-        verdict.unwrap_or(false)
-    };
-
-    Ok(LlmReply { commands, safe })
+    Ok(LlmReply { commands })
 }
 
-/// Extracts the leading `SAFE: yes|no` verdict from the model's response,
+/// Strips a legacy `SAFE: yes|no` marker for backwards compatibility. It no
+/// longer grants permission to execute. Extracts it from the model's response,
 /// returning the verdict (None when absent or malformed) and the content
 /// with the verdict line removed. Only the first meaningful line counts —
 /// a `SAFE:` string later in the response is treated as ordinary content.
@@ -991,12 +952,30 @@ fn process_prompt_with_context(
     history: &[ConversationContext],
     piped_data: Option<&str>,
     auto_mode: bool,
-) -> Result<(Vec<String>, Vec<String>), Box<dyn std::error::Error>> {
+) -> Result<ExecutionReport, Box<dyn std::error::Error>> {
     let reply = query_api(prompt, model, api_key, history, piped_data)?;
-    // Auto mode never applies when untrusted piped data is in context — its
-    // contents could have coaxed the model into a bogus `SAFE: yes`.
-    let auto_execute = auto_mode && reply.safe && piped_data.is_none();
-    execute_commands_with(reply.commands, theme, auto_execute, confirm, run_line)
+    // Judge the exact command just before execution. Neither the generator's
+    // old SAFE marker nor piped data can enable automatic execution.
+    let mut safety_available = true;
+    Ok(execute_commands_with(
+        reply.commands,
+        theme,
+        |command| {
+            if !auto_mode || piped_data.is_some() || !safety_available {
+                return false;
+            }
+            match safety::assess_cached(command, api_key) {
+                Ok(assessment) => assessment.permits_auto(),
+                Err(reason) => {
+                    eprintln!("{reason}; asking for confirmation for the remaining commands.");
+                    safety_available = false;
+                    false
+                }
+            }
+        },
+        confirm,
+        run_line,
+    ))
 }
 
 /// Executes one confirmed line from the model, resolving `$name args` tool
@@ -1018,85 +997,95 @@ fn run_line(command: &str) -> Result<String, Box<dyn std::error::Error>> {
     run_command_with_output(command)
 }
 
-// Commands that never run without explicit confirmation, even when the model
-// marks its response safe — a backstop against a misjudged or injected
-// `SAFE: yes` verdict.
+// A model verdict cannot override the application's execution policy.
 fn never_auto_execute(command: &str) -> bool {
-    // LLM-proposed `$tool` invocations always require confirmation — the
-    // approved checksum covers the script, not the arguments it runs with.
-    if command.trim_start().starts_with('$') {
-        return true;
-    }
-    const DENY: &[&str] = &[
-        "rm", "rmdir", "sudo", "dd", "shutdown", "reboot", "halt", "kill", "killall",
-    ];
-    command
-        .split_whitespace()
-        .any(|token| DENY.contains(&token) || token.starts_with("mkfs"))
+    !safety::eligible(command)
 }
 
-fn execute_commands_with<C, E>(
+fn execute_commands_with<A, C, E>(
     commands: Vec<String>,
     theme: &Theme,
-    auto_execute: bool,
+    mut auto_execute: A,
     mut confirm_command: C,
     mut execute_command: E,
-) -> Result<(Vec<String>, Vec<String>), Box<dyn std::error::Error>>
+) -> ExecutionReport
 where
+    A: FnMut(&str) -> bool,
     C: FnMut(&str, &Theme, bool) -> Result<ConfirmResponse, io::Error>,
     E: FnMut(&str) -> Result<String, Box<dyn std::error::Error>>,
 {
-    let mut executed_commands = Vec::new();
-    let mut command_outputs = Vec::new();
-
-    // Skip only means something when there is more than one command to skip
-    // between; with a single command it duplicates "no", so the prompt
-    // doesn't offer it.
-    let offer_skip = commands
-        .iter()
-        .filter(|command| !command.starts_with('#'))
-        .count()
-        > 1;
+    let mut report = ExecutionReport::default();
+    let mut stopped: Option<&str> = None;
+    let offer_skip = commands.iter().filter(|c| !c.starts_with('#')).count() > 1;
 
     for command in commands {
-        if command.starts_with('#') {
-            println!(
-                "{}\n",
-                theme.helper_text(command.trim_start_matches('#').trim())
-            );
-            continue;
-        }
-
-        if auto_execute && !never_auto_execute(&command) {
-            println!(
-                "{} {} {}",
-                theme.prompt_text("run>"),
-                theme.command_text(&command),
-                theme.helper_text("(auto)")
-            );
-            let output = execute_command(&command)?;
-            executed_commands.push(command.clone());
-            command_outputs.push(output);
-            continue;
-        }
-
-        match confirm_command(&command, theme, offer_skip)? {
-            ConfirmResponse::Yes => {
-                let output = execute_command(&command)?;
-                executed_commands.push(command.clone());
-                command_outputs.push(output);
+        let outcome = if command.starts_with('#') {
+            let text = command.trim_start_matches('#').trim();
+            println!("{}\n", theme.helper_text(text));
+            CommandOutcome {
+                command,
+                status: CommandStatus::Comment,
+                output: String::new(),
             }
-            ConfirmResponse::No => {
-                println!("Command execution cancelled");
-                return Ok((executed_commands, command_outputs));
+        } else if let Some(reason) = stopped {
+            println!("Not run ({reason}): {}", theme.command_text(&command));
+            CommandOutcome {
+                command,
+                status: CommandStatus::NotRun,
+                output: reason.to_string(),
             }
-            ConfirmResponse::Skip => {
-                println!("Skipping command: {}", theme.command_text(&command));
+        } else {
+            let choice = if !never_auto_execute(&command) && auto_execute(&command) {
+                println!(
+                    "{} {} {}",
+                    theme.prompt_text("run>"),
+                    theme.command_text(&command),
+                    theme.helper_text("(auto: Jev read-only)")
+                );
+                Ok(ConfirmResponse::Yes)
+            } else {
+                confirm_command(&command, theme, offer_skip)
+            };
+            match choice {
+                Ok(ConfirmResponse::Yes) => {
+                    let outcome = CommandOutcome::from_result(&command, execute_command(&command));
+                    if outcome.status == CommandStatus::Failed {
+                        outcome.print_failure();
+                        stopped = Some("earlier command failed");
+                    }
+                    outcome
+                }
+                Ok(ConfirmResponse::No) => {
+                    println!("Command execution cancelled");
+                    stopped = Some("execution cancelled");
+                    CommandOutcome {
+                        command,
+                        status: CommandStatus::Cancelled,
+                        output: String::new(),
+                    }
+                }
+                Ok(ConfirmResponse::Skip) => {
+                    println!("Skipping command: {}", theme.command_text(&command));
+                    CommandOutcome {
+                        command,
+                        status: CommandStatus::Skipped,
+                        output: String::new(),
+                    }
+                }
+                Err(error) => {
+                    eprintln!("Confirmation failed: {error}");
+                    stopped = Some("confirmation failed");
+                    CommandOutcome {
+                        command,
+                        status: CommandStatus::ConfirmationFailed,
+                        output: error.to_string(),
+                    }
+                }
             }
-        }
+        };
+        report.outcomes.push(outcome);
     }
-
-    Ok((executed_commands, command_outputs))
+    report
 }
 
 fn confirm(command: &str, theme: &Theme, offer_skip: bool) -> Result<ConfirmResponse, io::Error> {
@@ -1219,19 +1208,40 @@ fn run_command_with_output(command: &str) -> Result<String, Box<dyn std::error::
     let mut child = Command::new(&shell);
     child
         .arg("-c")
-        .arg(shell_script)
+        .arg(&shell_script)
         .env("ASK_CWD_CAPTURE", &cwd_capture_path);
 
     let has_terminal =
         io::stdin().is_terminal() && io::stdout().is_terminal() && io::stderr().is_terminal();
 
     let (status, result) = if has_terminal {
-        let status = child
+        // `script` gives the command a real terminal (including stdin) while
+        // we tee its visible output into bounded, in-memory context. No
+        // transcript is written to disk and hidden input is not recorded.
+        let mut terminal = Command::new("/usr/bin/script");
+        #[cfg(target_os = "macos")]
+        terminal.args(["-q", "/dev/null", &shell, "-c", &shell_script]);
+        #[cfg(not(target_os = "macos"))]
+        terminal.args([
+            "-q",
+            "-e",
+            "-c",
+            &format!(
+                "'{}' -c '{}'",
+                shell.replace('\'', "'\\''"),
+                shell_script.replace('\'', "'\\''")
+            ),
+            "/dev/null",
+        ]);
+        let mut terminal = terminal
+            .env("ASK_CWD_CAPTURE", &cwd_capture_path)
             .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
+            .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
-            .status()?;
-        (status, String::new())
+            .spawn()?;
+        let captured = capture_terminal_output(terminal.stdout.take().expect("piped stdout"));
+        let status = terminal.wait()?;
+        (status, captured?)
     } else {
         let output = child.output()?;
 
@@ -1266,10 +1276,75 @@ fn run_command_with_output(command: &str) -> Result<String, Box<dyn std::error::
     let _ = fs::remove_file(cwd_capture_path);
 
     if !status.success() {
-        return Err(format!("Command exited with status {status}").into());
+        return Err(format!(
+            "{}\nCommand exited with status {status}",
+            output_tail(&result, MAX_CAPTURE_BYTES)
+        )
+        .into());
     }
 
-    Ok(result)
+    Ok(output_tail(&result, MAX_CAPTURE_BYTES))
+}
+
+fn capture_terminal_output(mut reader: impl io::Read) -> io::Result<String> {
+    let mut captured = Vec::new();
+    let mut truncated = false;
+    let mut buffer = [0u8; 8192];
+    loop {
+        let size = match reader.read(&mut buffer) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if size == 0 {
+            break;
+        }
+        io::stdout().write_all(&buffer[..size])?;
+        io::stdout().flush()?;
+        captured.extend_from_slice(&buffer[..size]);
+        if captured.len() > MAX_CAPTURE_BYTES {
+            captured.drain(..captured.len() - MAX_CAPTURE_BYTES);
+            truncated = true;
+        }
+    }
+    let cleaned = clean_terminal_output(&String::from_utf8_lossy(&captured));
+    Ok(if truncated {
+        format!("... (earlier output truncated)\n{cleaned}")
+    } else {
+        cleaned
+    })
+}
+
+fn clean_terminal_output(value: &str) -> String {
+    let mut cleaned = String::new();
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            match chars.next() {
+                Some('[') => {
+                    for ch in chars.by_ref() {
+                        if ('@'..='~').contains(&ch) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    while let Some(ch) = chars.next() {
+                        if ch == '\u{7}' || (ch == '\u{1b}' && chars.next() == Some('\\')) {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        } else if ch == '\r' {
+            if chars.peek() != Some(&'\n') {
+                cleaned.push('\n');
+            }
+        } else if !ch.is_control() || ch == '\n' || ch == '\t' {
+            cleaned.push(ch);
+        }
+    }
+    cleaned
 }
 
 fn parse_commands(content: &str) -> Vec<String> {
@@ -1393,11 +1468,11 @@ Model selection:
 Auto mode:
   ask auto on / ask auto off (also works inside interactive mode)
 
-  The model labels each response safe or destructive. When auto mode is ON,
-  commands labeled safe run immediately without the [Y/n] prompt.
-  Destructive or unlabeled commands, piped-data sessions, and a deny-list
-  (rm, sudo, dd, kill, ...) always ask for confirmation. The setting is
-  remembered between sessions.
+  Jev independently checks each eligible generated command using the same
+  OpenRouter key. Confident read-only assessments run without the [Y/n] prompt.
+  Writes, scripts, complex shell syntax, piped-data sessions, uncertain results,
+  and unavailable safety checks still ask. The setting is remembered between
+  sessions and defaults to OFF.
 
 Tool library:
   ask tool new NAME WHAT IT DOES    Have the LLM write a reusable bash/python
@@ -1432,7 +1507,7 @@ Interactive mode commands:
   exit / quit       Exit interactive mode
   clear             Clear screen and reset conversation context
   finder            Open Finder window at current directory
-  auto on|off       Toggle auto-execution of model-labeled-safe commands
+  auto on|off       Toggle auto-execution of Jev-assessed read-only commands
   auto              Show whether auto mode is on
   model [MODEL]     Show or change the saved LLM model (also: model reset)
   tool ...          Manage the saved tool library (new, improve, list, show,
@@ -1441,12 +1516,10 @@ Interactive mode commands:
     );
 }
 
-/// Parsed model response: the returned lines plus the model's own verdict on
-/// whether every command is non-destructive (consumed by auto mode).
+/// Parsed command proposals. The generating model cannot authorize execution.
 #[derive(Debug)]
 struct LlmReply {
     commands: Vec<String>,
-    safe: bool,
 }
 
 impl std::ops::Deref for LlmReply {
@@ -1493,11 +1566,128 @@ enum ConfirmChoice {
     Skip,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandStatus {
+    Comment,
+    Succeeded,
+    Failed,
+    Skipped,
+    Cancelled,
+    NotRun,
+    ConfirmationFailed,
+}
+
+#[derive(Debug, Clone)]
+struct CommandOutcome {
+    command: String,
+    status: CommandStatus,
+    output: String,
+}
+
+impl CommandOutcome {
+    fn succeeded(command: &str, output: String) -> Self {
+        Self {
+            command: command.to_string(),
+            status: CommandStatus::Succeeded,
+            output,
+        }
+    }
+
+    fn from_result(command: &str, result: Result<String, Box<dyn std::error::Error>>) -> Self {
+        match result {
+            Ok(output) => Self::succeeded(command, output),
+            Err(error) => Self {
+                command: command.to_string(),
+                status: CommandStatus::Failed,
+                output: error.to_string(),
+            },
+        }
+    }
+
+    fn print_failure(&self) {
+        if self.status == CommandStatus::Failed {
+            eprintln!("Command failed: {}", self.output);
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ExecutionReport {
+    outcomes: Vec<CommandOutcome>,
+}
+
+impl ExecutionReport {
+    fn error(&self) -> Option<&str> {
+        self.outcomes
+            .iter()
+            .find(|o| {
+                matches!(
+                    o.status,
+                    CommandStatus::Failed | CommandStatus::ConfirmationFailed
+                )
+            })
+            .map(|o| o.output.as_str())
+    }
+}
+
 #[derive(Clone)]
 struct ConversationContext {
     prompt: String,
-    commands: Vec<String>,
-    outputs: Vec<String>,
+    outcomes: Vec<CommandOutcome>,
+}
+
+impl ConversationContext {
+    fn render(&self) -> String {
+        let mut context = format!("User: {}\n", self.prompt);
+        // Share the output allowance across this turn so several verbose
+        // commands do not evict the entire turn from the context window.
+        let output_count = self
+            .outcomes
+            .iter()
+            .filter(|o| !o.output.is_empty())
+            .count()
+            .max(1);
+        let output_budget = MAX_HISTORY_OUTPUT_BYTES / output_count;
+        for outcome in &self.outcomes {
+            if outcome.status == CommandStatus::Comment {
+                context.push_str(&format!(
+                    "Assistant: {}\n",
+                    outcome.command.trim_start_matches('#').trim()
+                ));
+                continue;
+            }
+            let status = match outcome.status {
+                CommandStatus::Succeeded => "succeeded (exit status 0)",
+                CommandStatus::Failed => "failed (may have partial effects; not rolled back)",
+                CommandStatus::Skipped => "skipped by user; not executed",
+                CommandStatus::Cancelled => "cancelled by user; not executed",
+                CommandStatus::NotRun => "not executed",
+                CommandStatus::ConfirmationFailed => "confirmation failed; not executed",
+                CommandStatus::Comment => unreachable!(),
+            };
+            context.push_str(&format!("Command: {}\nStatus: {status}\n", outcome.command));
+            if !outcome.output.is_empty() {
+                context.push_str(&format!(
+                    "Output: {}\n",
+                    output_tail(&outcome.output, output_budget)
+                ));
+            }
+        }
+        context.push('\n');
+        context
+    }
+}
+
+/// Preserve final diagnostics rather than the beginning of a long build log.
+fn output_tail(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut start = value.len() - max_bytes;
+    while !value.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("... (earlier output truncated)\n{}", &value[start..])
 }
 
 #[derive(Clone, Copy)]

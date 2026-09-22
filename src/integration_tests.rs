@@ -133,8 +133,10 @@ fn respects_conversation_history() {
     let (model, api_key, _t) = test_setup("history");
     let history = vec![ConversationContext {
         prompt: "list files".to_string(),
-        commands: vec!["ls -la".to_string()],
-        outputs: vec!["file1.txt\nfile2.txt\nREADME.md".to_string()],
+        outcomes: vec![CommandOutcome::succeeded(
+            "ls -la",
+            "file1.txt\nfile2.txt\nREADME.md".to_string(),
+        )],
     }];
     let result = query_api(
         "which of those is a markdown file?",
@@ -199,44 +201,6 @@ fn does_not_return_code_fences() {
             "Response should not contain code fences: {cmd}"
         );
     }
-}
-
-#[test]
-#[ignore]
-fn read_only_request_is_marked_safe() {
-    let (model, api_key, _t) = test_setup("safety_verdict_safe");
-    let reply = query_api(
-        "list files in the current directory",
-        &model,
-        &api_key,
-        &[],
-        None,
-    )
-    .expect("API call failed");
-    assert!(
-        reply.safe,
-        "a read-only listing should carry SAFE: yes: {:?}",
-        reply.commands
-    );
-}
-
-#[test]
-#[ignore]
-fn destructive_request_is_marked_unsafe() {
-    let (model, api_key, _t) = test_setup("safety_verdict_unsafe");
-    let reply = query_api(
-        "delete every file in the tmp-scratch directory",
-        &model,
-        &api_key,
-        &[],
-        None,
-    )
-    .expect("API call failed");
-    assert!(
-        !reply.safe,
-        "a deletion command must carry SAFE: no: {:?}",
-        reply.commands
-    );
 }
 
 #[test]
