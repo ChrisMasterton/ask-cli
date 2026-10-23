@@ -55,6 +55,53 @@ fn parse_confirmation_choice_supports_all_options() {
 }
 
 #[test]
+fn confirmation_eof_never_executes_a_command() {
+    if env::var_os("ASK_TEST_CONFIRMATION_EOF_CHILD").is_some() {
+        let mut executed = false;
+        let report = execute_commands_with(
+            vec!["echo should-not-run".to_string()],
+            &Theme::from_mode(ThemeMode::Dark),
+            |_| false,
+            confirm,
+            |_| {
+                executed = true;
+                Ok(String::new())
+            },
+        );
+        assert!(!executed, "EOF is not the user pressing Enter");
+        assert_eq!(report.outcomes[0].status, CommandStatus::ConfirmationFailed);
+        return;
+    }
+
+    use std::os::unix::process::CommandExt;
+    let mut child = Command::new(env::current_exe().unwrap());
+    child
+        .args([
+            "--exact",
+            "tests::confirmation_eof_never_executes_a_command",
+            "--nocapture",
+        ])
+        .env("ASK_TEST_CONFIRMATION_EOF_CHILD", "1")
+        .stdin(Stdio::null());
+    // Detach the child so it cannot read confirmation from the test runner's TTY.
+    unsafe {
+        child.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = child.output().unwrap();
+    assert!(
+        output.status.success(),
+        "EOF regression failed: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn confirmed_commands_execute_exactly_once_and_comments_never_execute() {
     let theme = Theme::from_mode(ThemeMode::Dark);
     let mut confirmations = VecDeque::from([ConfirmResponse::Yes]);
@@ -392,6 +439,19 @@ fn terminal_control_sequences_do_not_obscure_history() {
         clean_terminal_output("\x1b[31mError\x1b[0m: café\r\n\x1b]0;title\x07details\rnext"),
         "Error: café\ndetails\nnext"
     );
+}
+
+#[test]
+fn output_capture_streams_all_bytes_but_retains_only_recent_diagnostics() {
+    let mut bytes = vec![b'x'; MAX_CAPTURE_BYTES + 8192];
+    bytes.extend_from_slice(b"\nfinal diagnostic\n");
+    let mut visible = Vec::new();
+    let captured = capture_output(bytes.as_slice(), &mut visible).unwrap();
+    assert_eq!(visible, bytes, "streaming must not truncate visible output");
+    let marker = "... (earlier output truncated)\n";
+    assert!(captured.starts_with(marker));
+    assert!(captured.ends_with("\nfinal diagnostic\n"));
+    assert_eq!(captured.len(), marker.len() + MAX_CAPTURE_BYTES);
 }
 
 #[cfg(target_os = "macos")]

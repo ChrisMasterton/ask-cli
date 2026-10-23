@@ -109,9 +109,6 @@ fn read_piped_stdin() -> Option<String> {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    // Read piped data BEFORE anything else touches stdin.
-    let piped_data = read_piped_stdin();
-
     let args = parse_args()?;
     let theme = Theme::from_mode(args.theme);
 
@@ -119,7 +116,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(prompt) = &args.prompt
         && let Some(enabled) = parse_auto_toggle(prompt)
     {
-        set_auto_mode(enabled, &theme);
+        set_auto_mode(enabled, &theme)?;
         return Ok(());
     }
 
@@ -127,7 +124,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(prompt) = &args.prompt
         && let Some(command) = parse_model_command(prompt)
     {
-        apply_model_command(command, &theme);
+        apply_model_command(command, &theme, &args.model)?;
         return Ok(());
     }
 
@@ -158,6 +155,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let api_key = env::var("OPENROUTER_ASK_API_KEY")
         .map_err(|_| "Please set the OPENROUTER_ASK_API_KEY environment variable.")?;
+
+    // Only AI requests consume piped context. Local commands and argument
+    // errors must remain responsive even when an upstream pipe is still open.
+    let piped_data = read_piped_stdin();
 
     match args.prompt {
         Some(prompt) => {
@@ -201,13 +202,14 @@ fn parse_auto_toggle(input: &str) -> Option<bool> {
 }
 
 /// Persists the auto-mode preference and reports the new state.
-fn set_auto_mode(enabled: bool, theme: &Theme) {
+fn set_auto_mode(enabled: bool, theme: &Theme) -> Result<(), Box<dyn std::error::Error>> {
     let mut config = Config::load();
     config.auto = enabled;
-    if let Err(err) = config.save() {
-        eprintln!("Warning: could not save auto preference: {err}");
-    }
+    config
+        .save()
+        .map_err(|err| format!("Could not save auto preference: {err}"))?;
     println!("{}", theme.helper_text(auto_mode_description(enabled)));
+    Ok(())
 }
 
 fn auto_mode_description(enabled: bool) -> &'static str {
@@ -246,16 +248,24 @@ fn parse_model_command(input: &str) -> Option<ModelCommand> {
 
 /// Shows, persists, or resets the saved model preference. Returns the model
 /// now in effect so interactive mode can switch the live session too.
-fn apply_model_command(command: ModelCommand, theme: &Theme) -> String {
+fn apply_model_command(
+    command: ModelCommand,
+    theme: &Theme,
+    active_model: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
     let mut config = Config::load();
     match command {
         ModelCommand::Show => {
-            let (model, source) = match &config.model {
-                Some(model) => (model.clone(), "saved in ~/.ask/config"),
-                None => (DEFAULT_MODEL.to_string(), "built-in default"),
+            let source = match config.model.as_deref() {
+                Some(saved) if saved == active_model => "saved in ~/.ask/config",
+                None if active_model == DEFAULT_MODEL => "built-in default",
+                _ => "current session override",
             };
-            println!("{}", theme.helper_text(&format!("Model: {model} ({source})")));
-            model
+            println!(
+                "{}",
+                theme.helper_text(&format!("Model: {active_model} ({source})"))
+            );
+            Ok(active_model.to_string())
         }
         ModelCommand::Set(model) => {
             if !model.contains('/') {
@@ -265,27 +275,27 @@ fn apply_model_command(command: ModelCommand, theme: &Theme) -> String {
                 );
             }
             config.model = Some(model.clone());
-            if let Err(err) = config.save() {
-                eprintln!("Warning: could not save model preference: {err}");
-            }
+            config
+                .save()
+                .map_err(|err| format!("Could not save model preference: {err}"))?;
             println!(
                 "{}",
                 theme.helper_text(&format!("Model set to {model} and saved as the default"))
             );
-            model
+            Ok(model)
         }
         ModelCommand::Reset => {
             config.model = None;
-            if let Err(err) = config.save() {
-                eprintln!("Warning: could not save model preference: {err}");
-            }
+            config
+                .save()
+                .map_err(|err| format!("Could not save model preference: {err}"))?;
             println!(
                 "{}",
                 theme.helper_text(&format!(
                     "Model reset to the built-in default ({DEFAULT_MODEL})"
                 ))
             );
-            DEFAULT_MODEL.to_string()
+            Ok(DEFAULT_MODEL.to_string())
         }
     }
 }
@@ -574,8 +584,10 @@ fn run_interactive_mode(
         }
 
         if let Some(enabled) = parse_auto_toggle(input) {
-            auto = enabled;
-            set_auto_mode(enabled, theme);
+            match set_auto_mode(enabled, theme) {
+                Ok(()) => auto = enabled,
+                Err(err) => eprintln!("Error: {err}"),
+            }
             continue;
         }
 
@@ -585,7 +597,10 @@ fn run_interactive_mode(
         }
 
         if let Some(command) = parse_model_command(input) {
-            model = apply_model_command(command, theme);
+            match apply_model_command(command, theme, &model) {
+                Ok(updated) => model = updated,
+                Err(err) => eprintln!("Error: {err}"),
+            }
             continue;
         }
 
@@ -1149,7 +1164,13 @@ fn read_confirmation_line() -> Result<String, io::Error> {
             let mut byte = [0u8; 1];
             loop {
                 match reader.read(&mut byte) {
-                    Ok(0) => break, // EOF
+                    Ok(0) if input.is_empty() => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "No confirmation received before input closed",
+                        ));
+                    }
+                    Ok(0) => break,
                     Ok(_) => {
                         if byte[0] == b'\n' || byte[0] == b'\r' {
                             break;
@@ -1161,7 +1182,12 @@ fn read_confirmation_line() -> Result<String, io::Error> {
             }
         }
         Err(_) => {
-            io::stdin().read_line(&mut input)?;
+            if io::stdin().read_line(&mut input)? == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "No confirmation received before input closed",
+                ));
+            }
         }
     }
 
@@ -1243,25 +1269,28 @@ fn run_command_with_output(command: &str) -> Result<String, Box<dyn std::error::
         let status = terminal.wait()?;
         (status, captured?)
     } else {
-        let output = child.output()?;
-
-        if !output.stdout.is_empty() {
-            print!("{}", String::from_utf8_lossy(&output.stdout));
-            io::stdout().flush()?;
-        }
-        if !output.stderr.is_empty() {
-            eprint!("{}", String::from_utf8_lossy(&output.stderr));
-            io::stderr().flush()?;
-        }
-
-        let mut result = String::from_utf8_lossy(&output.stdout).to_string();
-        if !output.stderr.is_empty() {
+        let mut child = child
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        // Drain both streams while the command runs, so redirected output is
+        // visible immediately and neither a full pipe nor history capture can
+        // buffer an unbounded amount of data.
+        let stderr = child.stderr.take().expect("piped stderr");
+        let stderr_reader = std::thread::spawn(move || capture_output(stderr, io::stderr()));
+        let stdout = capture_output(child.stdout.take().expect("piped stdout"), io::stdout());
+        let stderr = stderr_reader.join();
+        let status = child.wait()?;
+        let mut result = stdout?;
+        let stderr = stderr.map_err(|_| io::Error::other("stderr capture failed"))??;
+        if !stderr.is_empty() {
             if !result.is_empty() {
                 result.push('\n');
             }
-            result.push_str(&String::from_utf8_lossy(&output.stderr));
+            result.push_str(&stderr);
         }
-        (output.status, result)
+        (status, result)
     };
 
     if let Ok(cwd) = fs::read_to_string(&cwd_capture_path) {
@@ -1286,7 +1315,11 @@ fn run_command_with_output(command: &str) -> Result<String, Box<dyn std::error::
     Ok(output_tail(&result, MAX_CAPTURE_BYTES))
 }
 
-fn capture_terminal_output(mut reader: impl io::Read) -> io::Result<String> {
+fn capture_terminal_output(reader: impl io::Read) -> io::Result<String> {
+    capture_output(reader, io::stdout()).map(|output| clean_terminal_output(&output))
+}
+
+fn capture_output(mut reader: impl io::Read, mut writer: impl Write) -> io::Result<String> {
     let mut captured = Vec::new();
     let mut truncated = false;
     let mut buffer = [0u8; 8192];
@@ -1298,19 +1331,19 @@ fn capture_terminal_output(mut reader: impl io::Read) -> io::Result<String> {
         if size == 0 {
             break;
         }
-        io::stdout().write_all(&buffer[..size])?;
-        io::stdout().flush()?;
+        writer.write_all(&buffer[..size])?;
+        writer.flush()?;
         captured.extend_from_slice(&buffer[..size]);
         if captured.len() > MAX_CAPTURE_BYTES {
             captured.drain(..captured.len() - MAX_CAPTURE_BYTES);
             truncated = true;
         }
     }
-    let cleaned = clean_terminal_output(&String::from_utf8_lossy(&captured));
+    let output = String::from_utf8_lossy(&captured);
     Ok(if truncated {
-        format!("... (earlier output truncated)\n{cleaned}")
+        format!("... (earlier output truncated)\n{output}")
     } else {
-        cleaned
+        output.into_owned()
     })
 }
 
@@ -1809,10 +1842,7 @@ impl Config {
     }
 
     fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let path = match config_path() {
-            Some(path) => path,
-            None => return Ok(()),
-        };
+        let path = config_path().ok_or("HOME is not set; cannot save ~/.ask/config.")?;
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)?;
         }
