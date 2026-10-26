@@ -370,6 +370,168 @@ fn approved_tool_lists_shows_and_runs_without_an_api_key() {
 }
 
 #[test]
+fn saved_tool_cli_arguments_keep_their_boundaries_and_literal_values() {
+    let home = fake_home("tool-argv");
+    seed_approved_tool(
+        &home,
+        "args",
+        "printf '%s\\0' \"$@\" > \"$HOME/received\"\n",
+    );
+    for args in [
+        vec![
+            "$args",
+            "folder with spaces",
+            "literal$PWD",
+            "",
+            "a; b",
+            "it's quoted",
+        ],
+        vec![
+            "--",
+            "$args",
+            "folder with spaces",
+            "literal$PWD",
+            "",
+            "a; b",
+            "it's quoted",
+        ],
+    ] {
+        let output = ask_command()
+            .args(&args)
+            .env("HOME", &home)
+            .env_remove("OPENROUTER_ASK_API_KEY")
+            .output()
+            .expect("run tool with separate CLI arguments");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read(home.join("received")).expect("read tool's saved arguments"),
+            b"folder with spaces\0literal$PWD\0\0a; b\0it's quoted\0",
+            "ask {args:?} must preserve the arguments received from the calling shell"
+        );
+    }
+
+    // Keep the documented single-string form working, including its shell quoting.
+    let output = ask_command()
+        .arg("$args 'folder with spaces' literal\\$PWD")
+        .env("HOME", &home)
+        .env_remove("OPENROUTER_ASK_API_KEY")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        std::fs::read(home.join("received")).unwrap(),
+        b"folder with spaces\0literal$PWD\0"
+    );
+    std::fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn saved_tool_options_are_passed_to_the_tool() {
+    let home = fake_home("tool-options");
+    seed_approved_tool(
+        &home,
+        "args",
+        "printf '%s\\0' \"$@\" > \"$HOME/received\"\n",
+    );
+    let output = ask_command()
+        .args([
+            "--model",
+            "vendor/session",
+            "$args",
+            "--help",
+            "--model",
+            "tool-model",
+            "--theme",
+            "tool-theme",
+        ])
+        .env("HOME", &home)
+        .env_remove("OPENROUTER_ASK_API_KEY")
+        .output()
+        .expect("run tool with its own options");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read(home.join("received")).expect("tool must run instead of showing Ask help"),
+        b"--help\0--model\0tool-model\0--theme\0tool-theme\0"
+    );
+    assert!(
+        !home.join(".ask/config").exists(),
+        "tool options must not change Ask preferences"
+    );
+    std::fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn saved_tool_keeps_terminal_stdin_when_output_is_redirected() {
+    use std::io::Write;
+    use std::os::fd::FromRawFd;
+
+    let home = fake_home("tool-terminal-input");
+    seed_approved_tool(
+        &home,
+        "input",
+        "test -t 0 || exit 19\nIFS= read -r answer || exit 20\nprintf '%s' \"$answer\" > \"$HOME/answer\"\nprintf 'input saved\\n'\n",
+    );
+    let (mut master_fd, mut slave_fd) = (-1, -1);
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        },
+        0,
+        "create a terminal for stdin"
+    );
+    let mut master = unsafe { std::fs::File::from_raw_fd(master_fd) };
+    let slave = unsafe { std::fs::File::from_raw_fd(slave_fd) };
+    let mut child = ask_command()
+        .arg("$input")
+        .env("HOME", &home)
+        .env_remove("OPENROUTER_ASK_API_KEY")
+        .stdin(Stdio::from(slave))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start tool with terminal input and redirected output");
+    master.write_all(b"typed answer\n").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let completed = loop {
+        if child.try_wait().unwrap().is_some() {
+            break true;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let output = child.wait_with_output().unwrap();
+    assert!(completed, "tool did not finish reading terminal input");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.join("answer")).unwrap(),
+        "typed answer"
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("input saved"));
+    std::fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
 fn tool_output_streams_before_the_command_finishes() {
     use std::io::BufRead;
     let home = fake_home("tool-stream");

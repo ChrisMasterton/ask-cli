@@ -821,13 +821,15 @@ fn build_prompt(prompt: &str, piped_data: Option<&str>, tool_catalog: &str) -> S
         };
         // No tool catalog in pipe mode: piped data is untrusted context, and
         // combining it with tool suggestions would stack two injection surfaces.
+        // Insert the request before the earlier context slot, replacing each
+        // slot once so literal placeholders in user content are left alone.
         PIPE_PROMPT_TEMPLATE
-            .replace("{piped_data}", &display_data)
-            .replace("{query}", prompt)
+            .replacen("{query}", prompt, 1)
+            .replacen("{piped_data}", &display_data, 1)
     } else {
         PROMPT_TEMPLATE
-            .replace("{tool_catalog}", tool_catalog)
-            .replace("{query}", prompt)
+            .replacen("{query}", prompt, 1)
+            .replacen("{tool_catalog}", tool_catalog, 1)
     }
 }
 
@@ -1237,8 +1239,9 @@ fn run_command_with_output(command: &str) -> Result<String, Box<dyn std::error::
         .arg(&shell_script)
         .env("ASK_CWD_CAPTURE", &cwd_capture_path);
 
+    let stdin_is_terminal = io::stdin().is_terminal();
     let has_terminal =
-        io::stdin().is_terminal() && io::stdout().is_terminal() && io::stderr().is_terminal();
+        stdin_is_terminal && io::stdout().is_terminal() && io::stderr().is_terminal();
 
     let (status, result) = if has_terminal {
         // `script` gives the command a real terminal (including stdin) while
@@ -1270,7 +1273,11 @@ fn run_command_with_output(command: &str) -> Result<String, Box<dyn std::error::
         (status, captured?)
     } else {
         let mut child = child
-            .stdin(Stdio::null())
+            .stdin(if stdin_is_terminal {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
@@ -1436,7 +1443,28 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
                 prompt_parts.extend(args);
                 break;
             }
-            _ => prompt_parts.push(arg),
+            _ => {
+                let is_tool =
+                    prompt_parts.is_empty() && tools::parse_tool_invocation(&arg).is_some();
+                prompt_parts.push(arg);
+                if is_tool {
+                    // Options after a tool invocation belong to that tool.
+                    prompt_parts.extend(args);
+                    break;
+                }
+            }
+        }
+    }
+
+    if prompt_parts
+        .first()
+        .is_some_and(|first| tools::parse_tool_invocation(first).is_some())
+    {
+        // The caller's shell already split separate argv entries. Quote them
+        // before the tool's shell runs, preserving spaces, empty values and $.
+        // The first entry retains the documented `$tool 'shell arguments'` form.
+        for arg in prompt_parts.iter_mut().skip(1) {
+            *arg = tools::shell_quote(arg);
         }
     }
 

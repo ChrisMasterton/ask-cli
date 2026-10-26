@@ -132,8 +132,10 @@ ask tool rm dedupe                # delete
 ```
 
 Quote the `$` sigil in your shell (`ask '$dedupe ...'`); in interactive mode
-no quoting is needed. Approved tools are also advertised to the LLM, so a
-prompt like "clean up my downloads" may come back proposing `$dedupe
+no quoting is needed. You can also quote just the name and pass normal shell
+arguments: `ask '$dedupe' "$HOME/Trip photos"`. Options after the tool name,
+including `--help`, go to the tool. Approved tools are also advertised to the
+LLM, so a prompt like "clean up my downloads" may come back proposing `$dedupe
 ~/Downloads` — those lines always require confirmation, even in auto mode.
 
 The safety model: you approve a script's exact source, and its SHA-256

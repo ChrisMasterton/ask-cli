@@ -782,6 +782,27 @@ fn piped_prompt_includes_request_and_unicode_data_without_panicking() {
 }
 
 #[test]
+fn piped_prompt_preserves_literal_placeholders_in_user_content() {
+    let request = "Explain {piped_data}, {tool_catalog}, and {query}";
+    let data = r#"{"query":"{query}","template":"{piped_data}"}"#;
+    let piped_prompt = build_prompt(request, Some(data), "");
+    assert!(
+        piped_prompt.contains(&format!("---BEGIN PIPED DATA---\n{data}\n---END PIPED DATA---")),
+        "piped data must reach the model unchanged: {piped_prompt}"
+    );
+    assert!(piped_prompt.ends_with(&format!("**User request:** {request}\n")));
+}
+
+#[test]
+fn normal_prompt_preserves_literal_placeholders_in_user_content() {
+    let request = "Explain {piped_data}, {tool_catalog}, and {query}";
+    let catalog = "- $render — Fill in the {query} placeholder";
+    let normal_prompt = build_prompt(request, None, catalog);
+    assert!(normal_prompt.contains(catalog), "tool descriptions must stay intact");
+    assert!(normal_prompt.ends_with(&format!("**User request:** {request}\n")));
+}
+
+#[test]
 fn api_response_requires_a_choice_and_nonempty_content() {
     let no_choice = commands_from_api_response(ApiResponse { choices: vec![] });
     assert!(no_choice.is_err());
