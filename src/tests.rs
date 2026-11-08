@@ -1,7 +1,26 @@
 use super::*;
+use crate::api::response::parse_commands;
+use crate::config::parse_on_off;
+use crate::config::preferences::{ModelCommand, parse_auto_toggle, parse_model_command};
+use crate::confirmation::ConfirmationDecision;
+use crate::confirmation::confirm_command;
+use crate::conversation::{
+    ConversationContext, MAX_CONTEXT_TOKENS, MAX_HISTORY_OUTPUT_BYTES, estimate_tokens,
+    estimated_history_tokens, render_context,
+};
+use crate::execution::execute_commands_with;
+use crate::execution::{CommandOutcome, CommandStatus};
+use crate::subprocess::run_utility;
+use crate::terminal_io::{MAX_CAPTURE_BYTES, capture_output, clean_terminal_output};
+use crate::text::truncate_utf8_bytes;
+use crate::working_directory::{DirectoryChange, DirectorySnapshot};
 use std::collections::VecDeque;
+use std::io::{self, IsTerminal};
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::{env, fs};
 
 static CURRENT_DIR_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -30,31 +49,6 @@ fn unique_temp_dir(name: &str) -> PathBuf {
 }
 
 #[test]
-fn normalize_confirmation_input_strips_ansi_sequences() {
-    let input = "\u{1b}[?2004lyes\u{1b}[?2004h\n";
-    assert_eq!(normalize_confirmation_input(input), "yes");
-}
-
-#[test]
-fn normalize_confirmation_input_keeps_valid_option() {
-    assert_eq!(normalize_confirmation_input("  s  \r\n"), "s");
-}
-
-#[test]
-fn parse_confirmation_choice_treats_escaped_yes_as_yes() {
-    let input = "\u{1b}[?2004ly\u{1b}[?2004h\n";
-    assert_eq!(parse_confirmation_choice(input), Some(ConfirmChoice::Yes));
-}
-
-#[test]
-fn parse_confirmation_choice_supports_all_options() {
-    assert_eq!(parse_confirmation_choice("n"), Some(ConfirmChoice::No));
-    assert_eq!(parse_confirmation_choice("skip"), Some(ConfirmChoice::Skip));
-    assert_eq!(parse_confirmation_choice("i"), None, "instruct was removed");
-    assert_eq!(parse_confirmation_choice("maybe"), None);
-}
-
-#[test]
 fn confirmation_eof_never_executes_a_command() {
     if env::var_os("ASK_TEST_CONFIRMATION_EOF_CHILD").is_some() {
         let mut executed = false;
@@ -62,7 +56,7 @@ fn confirmation_eof_never_executes_a_command() {
             vec!["echo should-not-run".to_string()],
             &Theme::from_mode(ThemeMode::Dark),
             |_| false,
-            confirm,
+            confirm_command,
             |_| {
                 executed = true;
                 Ok(String::new())
@@ -104,7 +98,7 @@ fn confirmation_eof_never_executes_a_command() {
 #[test]
 fn confirmed_commands_execute_exactly_once_and_comments_never_execute() {
     let theme = Theme::from_mode(ThemeMode::Dark);
-    let mut confirmations = VecDeque::from([ConfirmResponse::Yes]);
+    let mut confirmations = VecDeque::from([ConfirmationDecision::Accept]);
     let mut confirmed = Vec::new();
     let mut executed = Vec::new();
 
@@ -138,9 +132,9 @@ fn confirmed_commands_execute_exactly_once_and_comments_never_execute() {
 fn skip_and_cancel_never_execute_the_rejected_commands() {
     let theme = Theme::from_mode(ThemeMode::Dark);
     let mut confirmations = VecDeque::from([
-        ConfirmResponse::Skip,
-        ConfirmResponse::Yes,
-        ConfirmResponse::No,
+        ConfirmationDecision::Skip,
+        ConfirmationDecision::Accept,
+        ConfirmationDecision::Decline,
     ]);
     let mut executed = Vec::new();
 
@@ -174,18 +168,30 @@ fn skip_and_cancel_never_execute_the_rejected_commands() {
         ]
     );
     assert_eq!(result.outcomes[1].output, "output:run-me");
+    assert!(
+        result.error().is_none(),
+        "skip and cancel are not execution errors"
+    );
 }
 
 #[test]
 fn failed_execution_stops_the_flow_without_claiming_later_commands_ran() {
     let theme = Theme::from_mode(ThemeMode::Dark);
+    let mut confirmed = Vec::new();
     let mut executed = Vec::new();
 
     let result = execute_commands_with(
-        vec!["fails".to_string(), "must-not-run".to_string()],
+        vec![
+            "fails".to_string(),
+            "# explanation after failure".to_string(),
+            "must-not-run".to_string(),
+        ],
         &theme,
         |_| false,
-        |_, _, _| Ok(ConfirmResponse::Yes),
+        |command, _, _| {
+            confirmed.push(command.to_string());
+            Ok(ConfirmationDecision::Accept)
+        },
         |command| {
             executed.push(command.to_string());
             Err("simulated command failure".into())
@@ -193,7 +199,10 @@ fn failed_execution_stops_the_flow_without_claiming_later_commands_ran() {
     );
 
     assert_eq!(result.error(), Some("simulated command failure"));
-    assert_eq!(result.outcomes[1].status, CommandStatus::NotRun);
+    assert_eq!(result.outcomes[1].status, CommandStatus::Comment);
+    assert_eq!(result.outcomes[2].status, CommandStatus::NotRun);
+    assert_eq!(result.outcomes[2].output, "earlier command failed");
+    assert_eq!(confirmed, vec!["fails"]);
     assert_eq!(executed, vec!["fails"]);
 }
 
@@ -212,7 +221,7 @@ fn comment_lines_do_not_count_toward_offering_skip() {
         |_| false,
         |_, _, offer_skip| {
             offers.push(offer_skip);
-            Ok(ConfirmResponse::Yes)
+            Ok(ConfirmationDecision::Accept)
         },
         |command| Ok(format!("output:{command}")),
     );
@@ -223,7 +232,7 @@ fn comment_lines_do_not_count_toward_offering_skip() {
 #[test]
 fn parse_commands_preserves_chained_commands() {
     let input = "mkdir myproject && cd myproject && git init";
-    let commands = super::parse_commands(input);
+    let commands = parse_commands(input);
     assert_eq!(
         commands,
         vec!["mkdir myproject && cd myproject && git init"]
@@ -266,7 +275,7 @@ fn parse_commands_does_not_split_and_and_inside_quotes() {
 #[test]
 fn parse_commands_preserves_comment_lines() {
     let input = "# This will create a directory && init git\nmkdir foo && cd foo";
-    let commands = super::parse_commands(input);
+    let commands = parse_commands(input);
     assert_eq!(
         commands,
         vec![
@@ -318,6 +327,125 @@ fn command_execution_preserves_and_and_short_circuiting() {
 }
 
 #[test]
+fn failed_shell_status_still_applies_a_reported_directory() {
+    let _lock = CURRENT_DIR_TEST_LOCK.lock().unwrap();
+    let original = env::current_dir().unwrap();
+    let temp = unique_temp_dir("failed-cd-report");
+    let _cleanup = TempDirGuard(temp.clone());
+    let _restore = CurrentDirGuard(original);
+    let nested = temp.join("folder café with spaces");
+    fs::create_dir_all(&nested).unwrap();
+    env::set_current_dir(&temp).unwrap();
+
+    let error =
+        run_command_with_output(&format!("cd {}; false", shell_quote(&nested))).unwrap_err();
+    assert!(error.to_string().contains("exit status: 1"));
+    assert_eq!(env::current_dir().unwrap(), nested.canonicalize().unwrap());
+}
+
+#[test]
+fn early_shell_exit_does_not_invent_a_directory_report() {
+    let _lock = CURRENT_DIR_TEST_LOCK.lock().unwrap();
+    let original = env::current_dir().unwrap();
+    let temp = unique_temp_dir("early-exit-cd");
+    let _cleanup = TempDirGuard(temp.clone());
+    let _restore = CurrentDirGuard(original);
+    fs::create_dir_all(temp.join("nested")).unwrap();
+    env::set_current_dir(&temp).unwrap();
+
+    let error = run_command_with_output("cd nested; exit 7").unwrap_err();
+    assert!(error.to_string().contains("exit status: 7"));
+    assert_eq!(env::current_dir().unwrap(), temp.canonicalize().unwrap());
+}
+
+#[test]
+fn parent_navigation_and_directory_observation_share_the_directory_owner() {
+    let _lock = CURRENT_DIR_TEST_LOCK.lock().unwrap();
+    let original = env::current_dir().unwrap();
+    let temp = unique_temp_dir("parent-directory");
+    let _cleanup = TempDirGuard(temp.clone());
+    let _restore = CurrentDirGuard(original);
+    let nested = temp.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    env::set_current_dir(&nested).unwrap();
+
+    let snapshot = DirectorySnapshot::capture();
+    working_directory::change_to_parent().unwrap();
+    match snapshot.finish() {
+        DirectoryChange::Changed {
+            starting,
+            final_dir,
+        } => {
+            assert_eq!(starting, nested.canonicalize().unwrap());
+            assert_eq!(final_dir, temp.canonicalize().unwrap());
+        }
+        _ => panic!("parent navigation must be observed as a directory change"),
+    }
+    assert!(matches!(
+        DirectorySnapshot::capture().finish(),
+        DirectoryChange::Unchanged
+    ));
+}
+
+#[test]
+fn missing_empty_and_invalid_directory_reports_are_ignored_and_cleaned() {
+    let _lock = CURRENT_DIR_TEST_LOCK.lock().unwrap();
+    let starting = env::current_dir().unwrap();
+    for content in [None, Some(b" \n ".as_slice()), Some(b"\xff".as_slice())] {
+        let capture = working_directory::DirectoryCapture::new();
+        let path = capture.path().to_path_buf();
+        if let Some(content) = content {
+            fs::write(&path, content).unwrap();
+        }
+        capture.synchronize().unwrap();
+        assert!(!path.exists());
+        assert_eq!(env::current_dir().unwrap(), starting);
+    }
+}
+
+#[test]
+fn failed_directory_application_retains_the_error_and_skips_cleanup() {
+    let _lock = CURRENT_DIR_TEST_LOCK.lock().unwrap();
+    let starting = env::current_dir().unwrap();
+    let missing = unique_temp_dir("missing-cwd-target");
+    let capture = working_directory::DirectoryCapture::new();
+    let path = capture.path().to_path_buf();
+    fs::write(&path, missing.to_string_lossy().as_bytes()).unwrap();
+
+    let error = capture.synchronize().unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    assert!(path.is_file(), "directory failure precedes capture cleanup");
+    assert_eq!(env::current_dir().unwrap(), starting);
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn each_command_gets_a_fresh_shell_environment() {
+    let _lock = CURRENT_DIR_TEST_LOCK.lock().unwrap();
+    let variable = format!("ASK_SUBPROCESS_TEST_LOCAL_{}", std::process::id());
+    assert!(env::var_os(&variable).is_none());
+    run_command_with_output(&format!(
+        "export {variable}=present; test \"${variable}\" = present"
+    ))
+    .unwrap();
+    run_command_with_output(&format!("test -z \"${variable}\"")).unwrap();
+    assert!(env::var_os(variable).is_none());
+}
+
+#[test]
+fn utility_exit_statuses_and_spawn_errors_keep_their_existing_meaning() {
+    let _lock = CURRENT_DIR_TEST_LOCK.lock().unwrap();
+    let status = run_utility("/bin/sh", &["-c", "exit 9"]).unwrap();
+    assert_eq!(
+        status.code(),
+        Some(9),
+        "a nonzero utility status is still returned normally"
+    );
+    let missing = unique_temp_dir("missing-program");
+    assert!(run_utility(missing.to_str().unwrap(), &[]).is_err());
+}
+
+#[test]
 fn command_execution_returns_stdout_and_stderr_for_history() {
     let _lock = CURRENT_DIR_TEST_LOCK.lock().unwrap();
     let output =
@@ -356,7 +484,7 @@ fn partial_failure_and_final_diagnostic_reach_next_turn_context() {
         ],
         &theme,
         |_| false,
-        |_, _, _| Ok(ConfirmResponse::Yes),
+        |_, _, _| Ok(ConfirmationDecision::Accept),
         |command| {
             executed.push(command.to_string());
             run_command_with_output(command)
@@ -369,7 +497,7 @@ fn partial_failure_and_final_diagnostic_reach_next_turn_context() {
             .unwrap()
             .contains("missing widget configuration")
     );
-    let context = compact_history(&[ConversationContext {
+    let context = render_context(&[ConversationContext {
         prompt: "do the three steps".to_string(),
         outcomes: report.outcomes,
     }]);
@@ -392,7 +520,7 @@ fn confirmation_failure_preserves_success_and_marks_unrun_commands() {
         |_, _, _| {
             confirmations += 1;
             if confirmations == 1 {
-                Ok(ConfirmResponse::Yes)
+                Ok(ConfirmationDecision::Accept)
             } else {
                 Err(io::Error::other("terminal disconnected"))
             }
@@ -424,7 +552,7 @@ fn conversational_answers_remain_available_to_followups() {
         |_, _, _| panic!("comments must not prompt"),
         |_| panic!("comments must not execute"),
     );
-    let context = compact_history(&[ConversationContext {
+    let context = render_context(&[ConversationContext {
         prompt: "what are my options?".into(),
         outcomes: report.outcomes,
     }]);
@@ -658,7 +786,10 @@ fn safe_direct_command_rejects_shell_metacharacters() {
         "cd /tmp && rm -rf .",
         "grep foo bar.txt > out.txt",
     ] {
-        assert!(!is_safe_direct_command(cmd), "must require confirmation: {cmd}");
+        assert!(
+            !is_safe_direct_command(cmd),
+            "must require confirmation: {cmd}"
+        );
     }
 }
 
@@ -677,7 +808,10 @@ fn script_execution_rejects_inline_interpreter_code_and_chains() {
         "./run.sh && rm -rf ~",
     ] {
         assert!(!is_script_execution(cmd), "expected not a script: {cmd}");
-        assert!(!is_safe_direct_command(cmd), "must require confirmation: {cmd}");
+        assert!(
+            !is_safe_direct_command(cmd),
+            "must require confirmation: {cmd}"
+        );
     }
 }
 
@@ -700,26 +834,15 @@ fn interpreter_for_script_maps_known_extensions_only() {
     assert_eq!(interpreter_for_script("build.rs"), None);
 }
 
-// --- parse_confirmation_choice edge cases ---
-
-#[test]
-fn confirmation_empty_input_defaults_to_yes() {
-    assert_eq!(parse_confirmation_choice(""), Some(ConfirmChoice::Yes));
-}
-
-#[test]
-fn confirmation_is_case_insensitive_and_trims() {
-    assert_eq!(parse_confirmation_choice("YES"), Some(ConfirmChoice::Yes));
-    assert_eq!(parse_confirmation_choice("  No  "), Some(ConfirmChoice::No));
-}
-
 // --- token estimation ---
 
 #[test]
-fn estimate_tokens_uses_four_chars_per_token() {
+fn estimate_tokens_uses_four_bytes_per_token() {
     assert_eq!(estimate_tokens(""), 0);
     assert_eq!(estimate_tokens("abcd"), 1);
     assert_eq!(estimate_tokens(&"a".repeat(400)), 100);
+    assert_eq!(estimate_tokens("é"), 0);
+    assert_eq!(estimate_tokens("🚀"), 1);
 }
 
 #[test]
@@ -729,7 +852,7 @@ fn estimate_context_tokens_matches_rendered_history() {
         outcomes: vec![CommandOutcome::succeeded("xyz", "o".repeat(10000))],
     }];
     assert_eq!(
-        estimate_context_tokens(&history),
+        estimated_history_tokens(&history),
         estimate_tokens(&history[0].render())
     );
 }
@@ -743,172 +866,6 @@ fn truncate_utf8_bytes_never_splits_a_character() {
 }
 
 #[test]
-fn normal_prompt_requests_state_dependent_commands_as_one_chain() {
-    let prompt = build_prompt("create and enter a directory", None, "");
-    assert!(
-        prompt
-            .contains("Keep state-dependent steps such as `cd` or `export` in one `&&` chain")
-    );
-    assert!(prompt.contains("**User request:** create and enter a directory"));
-}
-
-#[test]
-fn normal_prompt_embeds_the_tool_catalog_and_leaves_no_placeholder() {
-    let catalog = "**User tool library**\n- $backup — back up things\n";
-    let prompt = build_prompt("list files", None, catalog);
-    assert!(prompt.contains("- $backup — back up things"));
-    assert!(!prompt.contains("{tool_catalog}"));
-
-    let without = build_prompt("list files", None, "");
-    assert!(!without.contains("{tool_catalog}"));
-    assert!(!without.contains("tool library"));
-}
-
-#[test]
-fn piped_prompt_never_contains_the_tool_catalog() {
-    let catalog = "**User tool library**\n- $backup — back up things\n";
-    let prompt = build_prompt("summarize", Some("some data"), catalog);
-    assert!(!prompt.contains("$backup"));
-    assert!(!prompt.contains("{tool_catalog}"));
-}
-
-#[test]
-fn piped_prompt_includes_request_and_unicode_data_without_panicking() {
-    let data = "🚀".repeat((MAX_PIPE_BYTES / 4) + 1);
-    let prompt = build_prompt("summarize", Some(&data), "");
-    assert!(prompt.contains("**User request:** summarize"));
-    assert!(prompt.contains("truncated"));
-    assert!(prompt.contains("---BEGIN PIPED DATA---"));
-}
-
-#[test]
-fn piped_prompt_preserves_literal_placeholders_in_user_content() {
-    let request = "Explain {piped_data}, {tool_catalog}, and {query}";
-    let data = r#"{"query":"{query}","template":"{piped_data}"}"#;
-    let piped_prompt = build_prompt(request, Some(data), "");
-    assert!(
-        piped_prompt.contains(&format!("---BEGIN PIPED DATA---\n{data}\n---END PIPED DATA---")),
-        "piped data must reach the model unchanged: {piped_prompt}"
-    );
-    assert!(piped_prompt.ends_with(&format!("**User request:** {request}\n")));
-}
-
-#[test]
-fn normal_prompt_preserves_literal_placeholders_in_user_content() {
-    let request = "Explain {piped_data}, {tool_catalog}, and {query}";
-    let catalog = "- $render — Fill in the {query} placeholder";
-    let normal_prompt = build_prompt(request, None, catalog);
-    assert!(normal_prompt.contains(catalog), "tool descriptions must stay intact");
-    assert!(normal_prompt.ends_with(&format!("**User request:** {request}\n")));
-}
-
-#[test]
-fn api_response_requires_a_choice_and_nonempty_content() {
-    let no_choice = commands_from_api_response(ApiResponse { choices: vec![] });
-    assert!(no_choice.is_err());
-
-    let empty_content = commands_from_api_response(ApiResponse {
-        choices: vec![Choice {
-            message: Message {
-                content: "  \n".to_string(),
-            },
-        }],
-    });
-    assert!(empty_content.is_err());
-}
-
-#[test]
-fn api_response_is_parsed_into_comments_and_intact_shell_lines() {
-    let reply = commands_from_api_response(ApiResponse {
-        choices: vec![Choice {
-            message: Message {
-                content: "SAFE: no\n# Set up the repo\nmkdir app && cd app && git init"
-                    .to_string(),
-            },
-        }],
-    })
-    .expect("valid model response");
-
-    assert_eq!(
-        reply.commands,
-        vec!["# Set up the repo", "mkdir app && cd app && git init"]
-    );
-}
-
-// --- safety verdict and auto mode ---
-
-#[test]
-fn safety_marker_is_parsed_and_stripped() {
-    let (verdict, rest) = extract_safety_marker("SAFE: yes\nls -la");
-    assert_eq!(verdict, Some(true));
-    assert_eq!(rest, "ls -la");
-
-    let (verdict, rest) = extract_safety_marker("safe: NO\nrm -rf build");
-    assert_eq!(verdict, Some(false));
-    assert_eq!(rest, "rm -rf build");
-}
-
-#[test]
-fn safety_marker_tolerates_decoration_and_fences() {
-    let (verdict, _) = extract_safety_marker("# SAFE: yes\nls");
-    assert_eq!(verdict, Some(true));
-
-    let (verdict, _) = extract_safety_marker("**SAFE: no**\nrm x");
-    assert_eq!(verdict, Some(false));
-
-    let (verdict, rest) = extract_safety_marker("```\nSAFE: no\nrm x\n```");
-    assert_eq!(verdict, Some(false));
-    assert!(rest.contains("rm x"));
-}
-
-#[test]
-fn missing_or_malformed_marker_yields_no_verdict() {
-    assert_eq!(extract_safety_marker("ls -la").0, None);
-    assert_eq!(extract_safety_marker("SAFE: maybe\nls").0, None);
-    // Only the FIRST meaningful line counts as a verdict.
-    assert_eq!(extract_safety_marker("# hello\nSAFE: yes\nls").0, None);
-}
-
-#[test]
-fn reply_without_legacy_verdict_still_parses() {
-    let reply = commands_from_api_response(ApiResponse {
-        choices: vec![Choice {
-            message: Message {
-                content: "mkdir app".to_string(),
-            },
-        }],
-    })
-    .expect("valid response");
-    assert_eq!(reply.commands, vec!["mkdir app"]);
-}
-
-#[test]
-fn legacy_verdict_is_removed_from_command_proposals() {
-    let reply = commands_from_api_response(ApiResponse {
-        choices: vec![Choice {
-            message: Message {
-                content: "SAFE: yes\nls -la".to_string(),
-            },
-        }],
-    })
-    .expect("valid response");
-    assert_eq!(reply.commands, vec!["ls -la"]);
-}
-
-#[test]
-fn conversational_reply_keeps_comment_lines() {
-    let reply = commands_from_api_response(ApiResponse {
-        choices: vec![Choice {
-            message: Message {
-                content: "# hello there!".to_string(),
-            },
-        }],
-    })
-    .expect("valid response");
-    assert_eq!(reply.commands, vec!["# hello there!"]);
-}
-
-#[test]
 fn auto_mode_executes_safe_commands_without_confirmation() {
     let theme = Theme::from_mode(ThemeMode::Dark);
     let mut executed = Vec::new();
@@ -917,7 +874,7 @@ fn auto_mode_executes_safe_commands_without_confirmation() {
         vec!["# listing files".to_string(), "ls -la".to_string()],
         &theme,
         |_| true,
-        |_, _, _| -> Result<ConfirmResponse, io::Error> {
+        |_, _, _| -> Result<ConfirmationDecision, io::Error> {
             panic!("auto mode must not prompt for a safe command")
         },
         |command| {
@@ -943,7 +900,7 @@ fn auto_mode_still_confirms_denylisted_commands() {
         |_| true,
         |command, _, _| {
             confirmed.push(command.to_string());
-            Ok(ConfirmResponse::No)
+            Ok(ConfirmationDecision::Decline)
         },
         |command| {
             executed.push(command.to_string());
@@ -962,8 +919,12 @@ fn auto_assessment_is_per_command_and_cannot_override_local_policy() {
     let mut confirmed = Vec::new();
     let mut executed = Vec::new();
     let report = execute_commands_with(
-        vec!["# inspection followed by a write".into(), "ls -la".into(),
-            "du -sh .".into(), "git reset --hard".into()],
+        vec![
+            "# inspection followed by a write".into(),
+            "ls -la".into(),
+            "du -sh .".into(),
+            "git reset --hard".into(),
+        ],
         &Theme::from_mode(ThemeMode::Dark),
         |command| {
             assessed.push(command.to_string());
@@ -971,7 +932,7 @@ fn auto_assessment_is_per_command_and_cannot_override_local_policy() {
         },
         |command, _, _| {
             confirmed.push(command.to_string());
-            Ok(ConfirmResponse::Skip)
+            Ok(ConfirmationDecision::Skip)
         },
         |command| {
             executed.push(command.to_string());
@@ -995,10 +956,10 @@ fn deny_list_blocks_dangerous_commands_from_auto_execution() {
         "kill $(lsof -t -i :3000)",
         "mkfs.ext4 /dev/sdb1",
     ] {
-        assert!(never_auto_execute(cmd), "must never auto-run: {cmd}");
+        assert!(!safety::eligible(cmd), "must never auto-run: {cmd}");
     }
     for cmd in ["ls -la", "git status", "du -sh ."] {
-        assert!(!never_auto_execute(cmd), "safe to auto-run: {cmd}");
+        assert!(safety::eligible(cmd), "safe to auto-run: {cmd}");
     }
 }
 
@@ -1006,9 +967,9 @@ fn deny_list_blocks_dangerous_commands_from_auto_execution() {
 fn tool_invocations_and_shell_expansions_require_confirmation() {
     // The approved checksum covers the script, not the arguments, so a
     // model-proposed `$tool` line must always be confirmed by hand.
-    assert!(never_auto_execute("$backup docs"));
-    assert!(never_auto_execute("  $ports"));
-    assert!(never_auto_execute("echo $HOME"));
+    assert!(!safety::eligible("$backup docs"));
+    assert!(!safety::eligible("  $ports"));
+    assert!(!safety::eligible("echo $HOME"));
 }
 
 #[test]
@@ -1030,8 +991,14 @@ fn on_off_values_parse_case_insensitively() {
 
 #[test]
 fn model_command_parses_show_set_and_reset() {
-    assert!(matches!(parse_model_command("model"), Some(ModelCommand::Show)));
-    assert!(matches!(parse_model_command("  MODEL  "), Some(ModelCommand::Show)));
+    assert!(matches!(
+        parse_model_command("model"),
+        Some(ModelCommand::Show)
+    ));
+    assert!(matches!(
+        parse_model_command("  MODEL  "),
+        Some(ModelCommand::Show)
+    ));
     assert!(matches!(
         parse_model_command("model openai/gpt-4o-mini"),
         Some(ModelCommand::Set(m)) if m == "openai/gpt-4o-mini"
@@ -1055,17 +1022,17 @@ fn model_command_ignores_ordinary_prompts() {
     assert!(parse_model_command("show me the model").is_none());
 }
 
-// --- compact_history ---
+// --- render_context ---
 
 #[test]
-fn compact_history_empty_returns_header_only() {
-    let out = compact_history(&[]);
+fn render_context_empty_returns_header_only() {
+    let out = render_context(&[]);
     assert!(out.contains("Previous commands and outputs"));
     assert!(!out.contains("(Note: Showing recent"));
 }
 
 #[test]
-fn compact_history_keeps_chronological_order_for_small_history() {
+fn render_context_keeps_chronological_order_for_small_history() {
     let history = vec![
         ConversationContext {
             prompt: "first-prompt".to_string(),
@@ -1076,7 +1043,7 @@ fn compact_history_keeps_chronological_order_for_small_history() {
             outcomes: vec![CommandOutcome::succeeded("pwd", String::new())],
         },
     ];
-    let out = compact_history(&history);
+    let out = render_context(&history);
     let first = out.find("first-prompt").expect("first present");
     let second = out.find("second-prompt").expect("second present");
     assert!(first < second, "expected chronological order");
@@ -1084,14 +1051,14 @@ fn compact_history_keeps_chronological_order_for_small_history() {
 }
 
 #[test]
-fn compact_history_truncates_when_over_token_budget() {
+fn render_context_truncates_when_over_token_budget() {
     let history: Vec<ConversationContext> = (0..40)
         .map(|_| ConversationContext {
             prompt: "p".repeat(1000),
             outcomes: vec![],
         })
         .collect();
-    let out = compact_history(&history);
+    let out = render_context(&history);
     assert!(
         out.contains("(Note: Showing recent"),
         "expected truncation note"
@@ -1103,7 +1070,7 @@ fn compact_history_truncates_when_over_token_budget() {
 }
 
 #[test]
-fn compact_history_handles_unicode_at_the_truncation_boundary() {
+fn render_context_handles_unicode_at_the_truncation_boundary() {
     let history = vec![ConversationContext {
         prompt: "show output".to_string(),
         outcomes: vec![CommandOutcome::succeeded(
@@ -1112,7 +1079,7 @@ fn compact_history_handles_unicode_at_the_truncation_boundary() {
         )],
     }];
 
-    let compacted = compact_history(&history);
+    let compacted = render_context(&history);
 
     assert!(compacted.contains("earlier output truncated"));
 }
@@ -1144,6 +1111,6 @@ fn theme_wraps_text_with_color_and_reset() {
     let theme = Theme::from_mode(ThemeMode::Dark);
     let painted = theme.helper_text("hello");
     assert!(painted.contains("hello"));
-    assert!(painted.ends_with(RESET));
-    assert!(painted.starts_with(theme.helper_color));
+    assert!(painted.ends_with("\x1b[0m"));
+    assert!(painted.starts_with("\x1b[36;1m"));
 }

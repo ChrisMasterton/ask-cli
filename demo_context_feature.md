@@ -1,110 +1,44 @@
 # Context Accumulation in Interactive Mode
 
-## Overview
-The interactive mode now maintains conversation context throughout your session. This means the LLM can see previous commands and their outputs, allowing for more intelligent suggestions based on what you've already done.
+The interactive session keeps prior outcomes as evidence for follow-up AI requests. Conversation context and readline input history have separate owners and lifetimes within the session.
 
-## How Context Works
+## What is remembered
 
-### Automatic Context Building
-- Each prompt you enter is remembered
-- Commands that were executed are tracked
-- Command outputs are captured and stored (truncated to 500 chars if too long)
-- This context is sent with each new prompt to the LLM
+Readline remembers every nonempty, trimmed input before dispatch, including local commands and requests that later fail. Empty input and Ctrl-C interruptions do not create entries.
 
-### Clear Command
-- Type `clear` to:
-  - Clear the terminal screen
-  - Reset all conversation context
-  - Start fresh with no history
+Conversation history records:
 
-## Example Session with Context
+- AI replies and command reports, including comments, success, failure, skip, cancellation, confirmation failure, and commands not run.
+- Direct command outcomes and approved saved-tool executions, including execution errors.
+- The `.` shortcut as `pwd`, and successful `..` navigation as `cd ..`.
 
-```
-$ ask
-Interactive mode. Type 'exit' or 'quit' to exit, 'clear' to reset.
+API/parsing failures and saved-tool resolution failures do not create conversation turns. Model/auto preferences, tool management, Finder, and exit commands remain in input history without becoming AI context.
 
-ask> create a test directory
-run> mkdir test_project? [Y/n/s/i] y
+A failed command may have partial effects. Its recorded status and diagnostics remain available alongside earlier successes; later commands stopped by the execution machine are recorded as not executed.
 
-ask> now create a Python file in that directory
-# The LLM knows you just created test_project, so it suggests:
-run> touch test_project/main.py? [Y/n/s/i] y
+## Follow-up requests
 
-ask> list what we've created so far
-# The LLM has context of the previous commands:
-run> ls -la test_project? [Y/n/s/i] y
-total 0
-drwxr-xr-x  3 user  staff   96 Jan 15 10:30 .
-drwxr-xr-x  5 user  staff  160 Jan 15 10:30 ..
--rw-r--r--  1 user  staff    0 Jan 15 10:30 main.py
+The model receives selected prior turns as a system message before the current request. A recorded command can appear as:
 
-ask> add a hello world to the python file
-# The LLM knows about test_project/main.py from context:
-run> echo 'print("Hello, World!")' > test_project/main.py? [Y/n/s/i] y
-
-ask> clear
-# Screen clears, context resets
-
-ask> what files are in test_project?
-# After clear, the LLM has no context of previous commands
-run> ls test_project? [Y/n/s/i] y
+```text
+User: list project files
+Command: ls -la
+Status: succeeded (exit status 0)
+Output: main.py
 ```
 
-## Benefits of Context
+Conversational replies appear as assistant text in the same context. The current prompt is recorded after its outcome returns, so it is not duplicated in the prior-history message.
 
-1. **Continuity**: The LLM understands what you've already done
-2. **Smarter Suggestions**: Commands build on previous work
-3. **Less Repetition**: No need to re-explain your project structure
-4. **Natural Workflow**: Work on tasks step-by-step with understanding
+Long output keeps final diagnostics. Recent whole turns are selected for the prompt using the existing token estimate; full retained history is not pruned by selection. See [token management](demo_token_limits.md) for exact limits and overflow behavior.
 
-## Context Limitations
+## Clearing and exit
 
-- Output is truncated to 500 characters per command to avoid token limits
-- Context is lost when you exit interactive mode
-- Context is cleared when you use the `clear` command
-- Very long sessions may hit API token limits
+`clear` runs the screen-clearing utility, resets conversation context, and redraws the banner. It keeps readline history, the selected model, auto mode, and working directory. A utility spawn/wait error ends the session before reset; a returned nonzero status still permits reset.
 
-## Implementation Details
+Ctrl-C while reading abandons the current input and returns to the prompt. EOF, `q`, `quit`, or `exit` ends the session. Conversation context is held in memory and is not restored in a new session.
 
-### What's Included in Context
-- User prompts
-- Executed commands (not skipped ones)
-- Command outputs (stdout and stderr)
-- Commands run via 'instruct' option are not tracked
+## Implementation
 
-### API Message Structure
-```json
-{
-  "messages": [
-    {
-      "role": "system",
-      "content": "Previous commands and outputs in this session:\n\nUser: create test file\nCommand: touch test.txt\nOutput: \n\n..."
-    },
-    {
-      "role": "user",
-      "content": "Your current prompt with template"
-    }
-  ]
-}
-```
-
-## Use Cases
-
-### Progressive Development
-Build a project step by step with the LLM understanding your progress:
-1. Create project structure
-2. Add configuration files
-3. Create source files
-4. Set up dependencies
-
-### Debugging Sessions
-Work through debugging with context:
-1. Run diagnostic commands
-2. Based on output, get targeted fix suggestions
-3. Apply fixes and verify
-
-### Learning and Exploration
-Explore a system with accumulated knowledge:
-1. Check system information
-2. Based on findings, explore specific areas
-3. Build understanding progressively
+- `src/session.rs` owns input routing and session effects.
+- `src/conversation.rs` owns record/clear transitions, outcome rendering, and prompt context selection.
+- `src/execution.rs` supplies the authoritative command outcomes used in context.

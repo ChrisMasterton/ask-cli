@@ -1,150 +1,43 @@
 # Token Limit Management
 
-## Overview
-The `ask` CLI now automatically manages conversation context to stay within API token limits, ensuring reliable operation even during long interactive sessions.
+`ask` selects recent conversation turns for each AI request. Selection limits the history sent to the model; it does not delete retained turns or summarize them.
 
-## How Token Management Works
+## Current limits
 
-### Token Estimation
-- Uses a conservative estimate of 1 token per 4 characters
-- Tracks total context size across all conversation history
-- Reserves ~1000 tokens for model responses
+- Token estimation uses UTF-8 byte length divided by four, rounded down.
+- Historical context selection has a 3000-token estimated budget.
+- Each turn shares a 4000-byte output allowance equally across its nonempty outputs. Truncation keeps the tail so final diagnostics survive; truncation markers add overhead.
+- Command output streams visibly in full. Subprocess capture retains the latest 64 KB per stream before the final command-output limit and context rendering apply.
 
-### Context Limits
-- **Maximum Context**: 3000 tokens (~12,000 characters)
-- **Output Truncation**: Long outputs truncated to 200 chars when compacting
-- **Automatic Compaction**: Keeps most recent interactions when limit approached
+This is an estimate for historical context, not a tokenizer count or a limit on the entire API request. The current prompt and saved-tool catalog are assembled separately.
 
-## Context Compaction Strategy
+## Selection lifecycle
 
-### When Context Exceeds Limits
-1. **Prioritizes Recent History**: Keeps the most recent interactions
-2. **Removes Oldest First**: Drops oldest context to make room
-3. **Smart Truncation**: More aggressive output truncation during compaction
-4. **User Notification**: Displays a note when compaction occurs
+The context machine in `src/conversation.rs`:
 
-### Visual Indicators
-```
-ask> [continue working...]
-Note: Context is being automatically compacted to fit within token limits.
-```
+1. Renders whole turns from newest to oldest.
+2. Includes each turn while it fits with the context header.
+3. Stops at the first turn that would exceed the budget.
+4. Restores chronological order and adds an omission note when needed.
 
-When context is compacted, the system message includes:
-```
+The omission note is outside the selection budget:
+
+```text
 (Note: Showing recent 5 of 12 total interactions due to length)
 ```
 
-## Example Long Session
+An oversized newest turn can leave zero turns selected. An oversized older turn also stops selection; the machine does not skip it to search for smaller earlier turns. Retained history remains available until `clear` or session exit.
 
-```
-$ ask
-Interactive mode. Type 'exit' or 'quit' to exit, 'clear' to reset.
+## Notifications
 
-ask> create a complex project structure
-run> mkdir -p project/{src,tests,docs}? [Y/n/s/i] y
+After ordinary command and AI outcomes are recorded, the session checks the estimate of all retained turns. If it exceeds 3000 tokens, it prints:
 
-[... many interactions later ...]
-
-ask> add final configuration
-run> echo "config complete" > project/config.txt? [Y/n/s/i] y
+```text
 Note: Context is being automatically compacted to fit within token limits.
-
-ask> what have we been working on?
-# Based on our recent interactions, we've been setting up a project with source, test, and documentation directories, and just added a configuration file. The earlier setup details have been condensed to stay within token limits.
 ```
 
-## Token Limits by Component
+This check can repeat on later turns. It excludes the context header and omission note, so its threshold differs from actual selection. The `.` and successful `..` shortcuts record context without checking this warning.
 
-### Character Estimates
-- **Base Context Header**: ~50 characters
-- **Per Interaction**:
-  - User prompt: Variable (typically 20-100 chars)
-  - Command: Variable (typically 20-80 chars)
-  - Output: Max 500 chars (normal), 200 chars (compacted)
+## Resetting context
 
-### Practical Limits
-- **Short Commands**: ~20-30 interactions before compaction
-- **Long Commands/Outputs**: ~10-15 interactions before compaction
-- **Conversational**: ~30-40 exchanges before compaction
-
-## Managing Long Sessions
-
-### Best Practices
-
-1. **Use `clear` Periodically**: Reset context when starting new tasks
-   ```
-   ask> clear
-   ```
-
-2. **Keep Outputs Concise**: Avoid commands with very long outputs
-   ```
-   # Instead of: cat large_file.txt
-   # Use: head -20 large_file.txt
-   ```
-
-3. **Segment Work**: Break complex tasks into logical sections
-   ```
-   ask> # Finished setup phase
-   ask> clear
-   ask> # Starting implementation phase
-   ```
-
-## Configuration Options
-
-### Current Settings (Hardcoded)
-```rust
-const MAX_CONTEXT_TOKENS: usize = 3000;
-const TOKEN_ESTIMATE_RATIO: usize = 4;
-```
-
-### Future Enhancements (Not Yet Implemented)
-- Model-specific token limits
-- Configurable compaction strategy
-- Token count display command
-- Manual context management
-
-## Technical Details
-
-### Compaction Algorithm
-1. Estimates tokens for each historical interaction
-2. Builds context from most recent backwards
-3. Stops when token limit would be exceeded
-4. Adds truncation notice if history was shortened
-
-### Token Estimation Formula
-```
-estimated_tokens = character_count / 4
-```
-
-This is conservative as most tokenizers average 3-5 characters per token.
-
-## Benefits
-
-### Reliability
-- Prevents API errors from token limit exceeded
-- Maintains functionality in long sessions
-- Graceful degradation of context
-
-### Performance
-- Faster API responses with managed context size
-- Lower API costs (tokens = cost)
-- Consistent response times
-
-### User Experience
-- Automatic management (no manual intervention needed)
-- Clear notifications when compaction occurs
-- Most recent context always preserved
-
-## Limitations
-
-### What's Lost During Compaction
-- Oldest interactions removed first
-- Very long outputs truncated more aggressively
-- Fine details from earlier commands
-
-### Workarounds
-- Use `clear` to reset when switching tasks
-- Keep important information in recent context
-- Re-explain context if needed after compaction
-
-The token management system ensures that `ask` remains responsive and reliable even during extended interactive sessions!
+`clear` resets conversation context and redraws the banner. Readline input history, model selection, auto mode, and working directory remain in effect. Context is otherwise retained in memory for the session and is not restored after exit.

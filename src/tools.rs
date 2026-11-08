@@ -7,10 +7,15 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::Theme;
+mod integrity;
+mod workflow;
+
+use integrity::{ToolIntegrity, inspect_tool};
+use workflow::{ToolWorkflowRequest, run_tool_workflow};
 
 const MANIFEST_FILE: &str = "manifest";
 const MAX_CATALOG_TOOLS: usize = 20;
@@ -102,14 +107,6 @@ pub(crate) enum ToolCommand {
     Improve { name: String, instructions: String },
 }
 
-#[derive(Debug, PartialEq)]
-pub(crate) enum ChecksumStatus {
-    Approved,
-    Unapproved,
-    Mismatch,
-    Broken(String),
-}
-
 pub(crate) fn tools_root() -> Option<PathBuf> {
     env::var_os("HOME").map(|home| PathBuf::from(home).join(".ask").join("tools"))
 }
@@ -142,8 +139,12 @@ pub(crate) fn load_manifest(root: &Path, name: &str) -> Result<ToolManifest, Str
         return Err(format!("No tool named '{name}'. See `tool list`."));
     }
     let path = dir.join(MANIFEST_FILE);
-    let contents = fs::read_to_string(&path)
-        .map_err(|err| format!("Cannot read manifest for '{name}' ({}): {err}", path.display()))?;
+    let contents = fs::read_to_string(&path).map_err(|err| {
+        format!(
+            "Cannot read manifest for '{name}' ({}): {err}",
+            path.display()
+        )
+    })?;
 
     let mut description = String::new();
     let mut lang = None;
@@ -195,27 +196,7 @@ pub(crate) fn tool_checksum(lang: ToolLang, script: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-pub(crate) fn checksum_status(root: &Path, name: &str) -> ChecksumStatus {
-    let manifest = match load_manifest(root, name) {
-        Ok(manifest) => manifest,
-        Err(err) => return ChecksumStatus::Broken(err),
-    };
-    let script = match fs::read(script_path(root, name, manifest.lang)) {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            return ChecksumStatus::Broken(format!("Cannot read script for '{name}': {err}"));
-        }
-    };
-    match &manifest.approved_sha256 {
-        None => ChecksumStatus::Unapproved,
-        Some(approved) if *approved == tool_checksum(manifest.lang, &script) => {
-            ChecksumStatus::Approved
-        }
-        Some(_) => ChecksumStatus::Mismatch,
-    }
-}
-
-pub(crate) fn list_tools(root: &Path) -> Vec<(String, Result<ToolManifest, String>)> {
+fn tool_names(root: &Path) -> Vec<String> {
     let Ok(entries) = fs::read_dir(root) else {
         return Vec::new();
     };
@@ -227,12 +208,6 @@ pub(crate) fn list_tools(root: &Path) -> Vec<(String, Result<ToolManifest, Strin
         .collect();
     names.sort();
     names
-        .into_iter()
-        .map(|name| {
-            let manifest = load_manifest(root, &name);
-            (name, manifest)
-        })
-        .collect()
 }
 
 /// Parses the `tool …` management command family. Only inputs whose second
@@ -301,16 +276,19 @@ pub(crate) fn parse_tool_invocation(input: &str) -> Option<(String, String)> {
 /// be encouraged to propose a script the user hasn't reviewed.
 pub(crate) fn catalog_block(root: &Path) -> String {
     let mut entries = Vec::new();
-    for (name, manifest) in list_tools(root) {
+    for name in tool_names(root) {
         if entries.len() >= MAX_CATALOG_TOOLS {
             break;
         }
-        let Ok(manifest) = manifest else { continue };
-        if checksum_status(root, &name) != ChecksumStatus::Approved {
+        let Ok(inspection) = inspect_tool(root, &name) else {
+            continue;
+        };
+        if inspection.integrity != ToolIntegrity::Approved {
             continue;
         }
+        let manifest = inspection.manifest;
         let (description, truncated) =
-            crate::truncate_utf8_bytes(&manifest.description, MAX_CATALOG_DESCRIPTION_BYTES);
+            crate::text::truncate_utf8_bytes(&manifest.description, MAX_CATALOG_DESCRIPTION_BYTES);
         let suffix = if truncated { "…" } else { "" };
         entries.push(format!("- ${name} — {description}{suffix}"));
     }
@@ -318,7 +296,7 @@ pub(crate) fn catalog_block(root: &Path) -> String {
         return String::new();
     }
     format!(
-        "**User tool library** — reusable scripts this user has saved:\n{}\nTo run one, output a line of exactly the form `$name args` (the `$` sigil plus the tool name — no interpreter, no path). Only reference tools from this list, and treat `$name` lines as commands when deciding the SAFE verdict.\n",
+        "**User tool library** — reusable scripts this user has saved:\n{}\nTo run one, output a line of exactly the form `$name args` (the `$` sigil plus the tool name — no interpreter, no path). Only reference tools from this list, and treat `$name` lines as executable commands, not commentary.\n",
         entries.join("\n")
     )
 }
@@ -338,21 +316,7 @@ pub(crate) fn resolve_approved_tool(
     if !is_valid_tool_name(name) {
         return Err(format!("Invalid tool name '{name}'."));
     }
-    let manifest = load_manifest(root, name)?;
-    match checksum_status(root, name) {
-        ChecksumStatus::Approved => {}
-        ChecksumStatus::Unapproved => {
-            return Err(format!(
-                "Tool '{name}' has not been approved yet — review it with `tool show {name}`, then `tool approve {name}`."
-            ));
-        }
-        ChecksumStatus::Mismatch => {
-            return Err(format!(
-                "The script for '{name}' changed since it was approved — refusing to run. Review it with `tool show {name}`, then `tool approve {name}`."
-            ));
-        }
-        ChecksumStatus::Broken(reason) => return Err(reason),
-    }
+    let manifest = inspect_tool(root, name)?.into_approved_manifest(name)?;
     let script = script_path(root, name, manifest.lang);
     let mut line = format!(
         "{} {}",
@@ -367,16 +331,6 @@ pub(crate) fn resolve_approved_tool(
     Ok(line)
 }
 
-/// Records the current script bytes as the approved version.
-pub(crate) fn approve_tool(root: &Path, name: &str) -> Result<(), String> {
-    let mut manifest = load_manifest(root, name)?;
-    let script = fs::read(script_path(root, name, manifest.lang))
-        .map_err(|err| format!("Cannot read script for '{name}': {err}"))?;
-    manifest.approved_sha256 = Some(tool_checksum(manifest.lang, &script));
-    save_manifest(root, name, &manifest)
-        .map_err(|err| format!("Could not save manifest for '{name}': {err}"))
-}
-
 /// Strips a leading/trailing ``` fence pair (and surrounding blank lines)
 /// while leaving the body byte-for-byte intact — unlike `parse_commands`,
 /// which trims every line and would destroy Python indentation.
@@ -388,18 +342,23 @@ pub(crate) fn strip_code_fences(content: &str) -> String {
     while lines.last().is_some_and(|line| line.trim().is_empty()) {
         lines.pop();
     }
-    if lines.first().is_some_and(|line| line.trim().starts_with("```")) {
+    if lines
+        .first()
+        .is_some_and(|line| line.trim().starts_with("```"))
+    {
         lines.remove(0);
     }
-    if lines.last().is_some_and(|line| line.trim().starts_with("```")) {
+    if lines
+        .last()
+        .is_some_and(|line| line.trim().starts_with("```"))
+    {
         lines.pop();
     }
     lines.join("\n")
 }
 
 /// Parses a `tool new` reply: a first line `LANG: bash|python` (tolerating
-/// `# `/`**` decoration, like the SAFE verdict) followed by the verbatim
-/// script body.
+/// comment or bold decoration) followed by the verbatim script body.
 pub(crate) fn parse_generated_tool(content: &str) -> Result<(ToolLang, String), String> {
     let stripped = strip_code_fences(content);
     let mut lang = None;
@@ -438,15 +397,6 @@ fn ensure_trailing_newline(mut body: String) -> String {
     body
 }
 
-fn describe_status(status: &ChecksumStatus) -> &str {
-    match status {
-        ChecksumStatus::Approved => "approved",
-        ChecksumStatus::Unapproved => "NOT approved — run `tool approve <name>` after review",
-        ChecksumStatus::Mismatch => "EDITED since approval — re-approve after review",
-        ChecksumStatus::Broken(reason) => reason,
-    }
-}
-
 fn require_root() -> Result<PathBuf, String> {
     tools_root().ok_or_else(|| "HOME is not set; cannot locate ~/.ask/tools.".to_string())
 }
@@ -468,16 +418,6 @@ fn require_api_key() -> Result<String, String> {
         .map_err(|_| "Please set the OPENROUTER_ASK_API_KEY environment variable.".to_string())
 }
 
-// Approval blesses a checksum and writes to disk, so it demands an explicit
-// `y` — unlike command confirmation, Enter does not default to yes.
-fn confirm_explicit_yes(question: &str, theme: &Theme) -> io::Result<bool> {
-    print!("{} ", theme.prompt_text(question));
-    io::stdout().flush()?;
-    let input = crate::read_confirmation_line()?;
-    let normalized = crate::normalize_confirmation_input(&input);
-    Ok(normalized == "y" || normalized == "yes")
-}
-
 fn print_source(theme: &Theme, name: &str, lang: ToolLang, source: &str) {
     println!(
         "{}",
@@ -495,11 +435,12 @@ fn call_llm_content(
     model: &str,
     api_key: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let response = crate::call_llm(vec![json!({"role": "user", "content": prompt})], model, api_key)?;
-    let content = response
-        .first_content()
-        .ok_or("The model returned an empty reply.")?;
-    Ok(content.to_string())
+    let response = crate::api::call_llm(
+        vec![json!({"role": "user", "content": prompt})],
+        model,
+        api_key,
+    )?;
+    crate::api::response::tool_content_from_api_response(response)
 }
 
 pub(crate) fn handle_tool_command(
@@ -510,7 +451,7 @@ pub(crate) fn handle_tool_command(
     match command {
         ToolCommand::List => {
             let root = require_root()?;
-            let tools = list_tools(&root);
+            let tools = tool_names(&root);
             if tools.is_empty() {
                 println!(
                     "{}",
@@ -520,14 +461,14 @@ pub(crate) fn handle_tool_command(
                 );
                 return Ok(());
             }
-            for (name, manifest) in tools {
-                match manifest {
-                    Ok(manifest) => {
-                        let status = checksum_status(&root, &name);
-                        let flag = match status {
-                            ChecksumStatus::Approved => String::new(),
-                            other => format!("  [{}]", describe_status(&other)),
+            for name in tools {
+                match inspect_tool(&root, &name) {
+                    Ok(inspection) => {
+                        let flag = match &inspection.integrity {
+                            ToolIntegrity::Approved => String::new(),
+                            other => format!("  [{}]", other.description()),
                         };
+                        let manifest = inspection.manifest;
                         println!(
                             "  {} ({}) — {}{}",
                             theme.command_text(&format!("${name}")),
@@ -549,7 +490,8 @@ pub(crate) fn handle_tool_command(
         ToolCommand::Show(name) => {
             let name = require_name(&name, "tool show <name>")?;
             let root = require_root()?;
-            let manifest = load_manifest(&root, name)?;
+            let inspection = inspect_tool(&root, name)?;
+            let manifest = &inspection.manifest;
             let script = script_path(&root, name, manifest.lang);
             let source = fs::read_to_string(&script)
                 .map_err(|err| format!("Cannot read script for '{name}': {err}"))?;
@@ -566,7 +508,7 @@ pub(crate) fn handle_tool_command(
                 theme.helper_text(&format!(
                     "Script: {} ({})",
                     script.display(),
-                    describe_status(&checksum_status(&root, name))
+                    inspection.integrity.description()
                 ))
             );
             println!();
@@ -586,117 +528,17 @@ pub(crate) fn handle_tool_command(
             );
         }
         ToolCommand::Approve(name) => {
-            let name = require_name(&name, "tool approve <name>")?;
-            let root = require_root()?;
-            let manifest = load_manifest(&root, name)?;
-            let source = fs::read_to_string(script_path(&root, name, manifest.lang))
-                .map_err(|err| format!("Cannot read script for '{name}': {err}"))?;
-            print_source(theme, name, manifest.lang, &source);
-            if !confirm_explicit_yes(&format!("Approve this script for '${name}'? [y/N]"), theme)? {
-                println!("Not approved.");
-                return Ok(());
-            }
-            approve_tool(&root, name)?;
-            println!(
-                "{}",
-                theme.helper_text(&format!("Approved. Run it with: ${name} <args>"))
-            );
+            run_tool_workflow(ToolWorkflowRequest::Approve(name), model, theme)?;
         }
         ToolCommand::New { name, description } => {
-            let name = require_name(&name, "tool new <name> <what it should do>")?;
-            let description = description.trim().to_string();
-            if description.is_empty() {
-                return Err("Usage: tool new <name> <what it should do>".into());
-            }
-            let root = require_root()?;
-            if tool_dir(&root, name).exists() {
-                return Err(format!(
-                    "Tool '{name}' already exists — use `tool improve {name} <instructions>` or `tool rm {name}` first."
-                )
-                .into());
-            }
-            let api_key = require_api_key()?;
-            println!(
-                "{}",
-                theme.helper_text(&format!("Asking the model to write '{name}'…"))
-            );
-            let prompt = TOOL_NEW_TEMPLATE
-                .replace("{name}", name)
-                .replace("{description}", &description);
-            let content = call_llm_content(prompt, model, &api_key)?;
-            let (lang, body) = parse_generated_tool(&content)?;
-            print_source(theme, name, lang, &body);
-            if !confirm_explicit_yes("Save and approve this script? [y/N]", theme)? {
-                println!("Discarded — nothing was saved.");
-                return Ok(());
-            }
-            let dir = tool_dir(&root, name);
-            fs::create_dir_all(&dir)?;
-            fs::write(dir.join(lang.script_file()), &body)?;
-            let manifest = ToolManifest {
-                description,
-                lang,
-                approved_sha256: Some(tool_checksum(lang, body.as_bytes())),
-            };
-            save_manifest(&root, name, &manifest)?;
-            println!(
-                "{}",
-                theme.helper_text(&format!(
-                    "Saved {} — run it with: ${name} <args>",
-                    dir.join(lang.script_file()).display()
-                ))
-            );
+            run_tool_workflow(ToolWorkflowRequest::New { name, description }, model, theme)?;
         }
         ToolCommand::Improve { name, instructions } => {
-            let name = require_name(&name, "tool improve <name> <instructions>")?;
-            let instructions = instructions.trim().to_string();
-            if instructions.is_empty() {
-                return Err("Usage: tool improve <name> <instructions>".into());
-            }
-            let root = require_root()?;
-            let manifest = load_manifest(&root, name)?;
-            let script = script_path(&root, name, manifest.lang);
-            let current = fs::read_to_string(&script)
-                .map_err(|err| format!("Cannot read script for '{name}': {err}"))?;
-            let api_key = require_api_key()?;
-            println!(
-                "{}",
-                theme.helper_text(&format!("Asking the model to improve '{name}'…"))
-            );
-            let prompt = TOOL_IMPROVE_TEMPLATE
-                .replace("{name}", name)
-                .replace("{lang}", manifest.lang.as_str())
-                .replace("{current_script}", &current)
-                .replace("{instructions}", &instructions);
-            let content = call_llm_content(prompt, model, &api_key)?;
-            // The template says "no LANG line", but tolerate one as long as
-            // it doesn't try to switch the language out from under the tool.
-            let body = match parse_generated_tool(&content) {
-                Ok((lang, body)) if lang == manifest.lang => body,
-                Ok((lang, _)) => {
-                    return Err(format!(
-                        "The model tried to switch '{name}' from {} to {} — not applied.",
-                        manifest.lang.as_str(),
-                        lang.as_str()
-                    )
-                    .into());
-                }
-                Err(_) => ensure_trailing_newline(strip_code_fences(&content)),
-            };
-            if body.trim().is_empty() {
-                return Err("The model returned no script body — nothing changed.".into());
-            }
-            print_source(theme, name, manifest.lang, &body);
-            if !confirm_explicit_yes("Apply and approve this new version? [y/N]", theme)? {
-                println!("Discarded — the existing tool is unchanged.");
-                return Ok(());
-            }
-            fs::write(&script, &body)?;
-            approve_tool(&root, name)?;
-            println!(
-                "{}",
-                theme.helper_text(&format!("Updated. Run it with: ${name} <args>"))
-            );
+            run_tool_workflow(
+                ToolWorkflowRequest::Improve { name, instructions },
+                model,
+                theme,
+            )?;
         }
     }
     Ok(())
@@ -707,7 +549,7 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    struct TempDirGuard(PathBuf);
+    pub(super) struct TempDirGuard(PathBuf);
 
     impl Drop for TempDirGuard {
         fn drop(&mut self) {
@@ -715,7 +557,7 @@ mod tests {
         }
     }
 
-    fn unique_tools_root(name: &str) -> (TempDirGuard, PathBuf) {
+    pub(super) fn unique_tools_root(name: &str) -> (TempDirGuard, PathBuf) {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock before unix epoch")
@@ -725,7 +567,7 @@ mod tests {
         (TempDirGuard(path.clone()), path)
     }
 
-    fn seed_tool(root: &Path, name: &str, lang: ToolLang, script: &str, approved: bool) {
+    pub(super) fn seed_tool(root: &Path, name: &str, lang: ToolLang, script: &str, approved: bool) {
         let manifest = ToolManifest {
             description: format!("test tool {name}"),
             lang,
@@ -742,7 +584,15 @@ mod tests {
         }
         let too_long = "a".repeat(33);
         for bad in [
-            "", "../x", "a/b", ".hidden", "Backup", "a b", "-lead", "_lead", "~x",
+            "",
+            "../x",
+            "a/b",
+            ".hidden",
+            "Backup",
+            "a b",
+            "-lead",
+            "_lead",
+            "~x",
             too_long.as_str(),
         ] {
             assert!(!is_valid_tool_name(bad), "{bad:?} should be invalid");
@@ -797,7 +647,15 @@ mod tests {
             parse_tool_invocation("$backup ~/docs \"a b\""),
             Some(("backup".to_string(), "~/docs \"a b\"".to_string()))
         );
-        for not_an_invocation in ["$", "$ x", "$(pwd)", "$HOME/x", "$Bad", "$hello;rm x", "echo $backup"] {
+        for not_an_invocation in [
+            "$",
+            "$ x",
+            "$(pwd)",
+            "$HOME/x",
+            "$Bad",
+            "$hello;rm x",
+            "echo $backup",
+        ] {
             assert_eq!(
                 parse_tool_invocation(not_an_invocation),
                 None,
@@ -827,20 +685,32 @@ mod tests {
         assert_eq!(loaded.approved_sha256, manifest.approved_sha256);
 
         fs::write(&path, "description=x\n").expect("drop lang line");
-        assert!(load_manifest(&root, "demo").is_err(), "missing lang must fail");
+        assert!(
+            load_manifest(&root, "demo").is_err(),
+            "missing lang must fail"
+        );
     }
 
     #[test]
-    fn checksum_status_covers_all_states_including_lang_swap() {
+    fn integrity_inspection_rechecks_edits_and_language_changes() {
         let (_guard, root) = unique_tools_root("checksum");
         seed_tool(&root, "ok", ToolLang::Bash, "echo hi\n", true);
-        assert_eq!(checksum_status(&root, "ok"), ChecksumStatus::Approved);
+        assert_eq!(
+            inspect_tool(&root, "ok").unwrap().integrity,
+            ToolIntegrity::Approved
+        );
 
         seed_tool(&root, "pending", ToolLang::Bash, "echo hi\n", false);
-        assert_eq!(checksum_status(&root, "pending"), ChecksumStatus::Unapproved);
+        assert_eq!(
+            inspect_tool(&root, "pending").unwrap().integrity,
+            ToolIntegrity::Unapproved
+        );
 
         fs::write(tool_dir(&root, "ok").join("main.sh"), "echo tampered\n").expect("tamper");
-        assert_eq!(checksum_status(&root, "ok"), ChecksumStatus::Mismatch);
+        assert_eq!(
+            inspect_tool(&root, "ok").unwrap().integrity,
+            ToolIntegrity::Mismatch
+        );
 
         // Swapping lang= in the manifest must not survive either: the hash
         // covers the interpreter, and the script file for the new lang is
@@ -852,12 +722,16 @@ mod tests {
             .replace("lang=bash", "lang=python");
         fs::write(&manifest_path, contents).expect("swap lang");
         fs::write(tool_dir(&root, "swapped").join("main.py"), "echo hi\n").expect("plant script");
-        assert_eq!(checksum_status(&root, "swapped"), ChecksumStatus::Mismatch);
+        assert_eq!(
+            inspect_tool(&root, "swapped").unwrap().integrity,
+            ToolIntegrity::Mismatch
+        );
 
-        assert!(matches!(
-            checksum_status(&root, "missing"),
-            ChecksumStatus::Broken(_)
-        ));
+        assert!(inspect_tool(&root, "missing").is_err());
+        fs::remove_file(tool_dir(&root, "pending").join("main.sh")).unwrap();
+        let broken = inspect_tool(&root, "pending").unwrap();
+        assert_eq!(broken.manifest.lang, ToolLang::Bash);
+        assert!(matches!(broken.integrity, ToolIntegrity::Broken(_)));
     }
 
     #[test]
@@ -877,11 +751,17 @@ mod tests {
 
         seed_tool(&root, "pending", ToolLang::Bash, "echo hi\n", false);
         let err = resolve_approved_tool(&root, "pending", "").unwrap_err();
-        assert!(err.contains("tool approve"), "unapproved error should guide: {err}");
+        assert!(
+            err.contains("tool approve"),
+            "unapproved error should guide: {err}"
+        );
 
         fs::write(tool_dir(&root, "greet").join("main.py"), "print('evil')\n").expect("tamper");
         let err = resolve_approved_tool(&root, "greet", "").unwrap_err();
-        assert!(err.contains("changed since"), "mismatch error should explain: {err}");
+        assert!(
+            err.contains("changed since"),
+            "mismatch error should explain: {err}"
+        );
 
         assert!(resolve_approved_tool(&root, "nope", "").is_err());
         assert!(resolve_approved_tool(&root, "../etc", "").is_err());
@@ -896,15 +776,6 @@ mod tests {
         let resolved = resolve_approved_tool(&root, "hi", "").expect("resolve");
         let script = tool_dir(&root, "hi").join("main.sh");
         assert_eq!(resolved, format!("bash '{}'", script.display()));
-    }
-
-    #[test]
-    fn approve_tool_blesses_the_current_script_bytes() {
-        let (_guard, root) = unique_tools_root("approve");
-        seed_tool(&root, "greet", ToolLang::Bash, "echo hi\n", false);
-        assert_eq!(checksum_status(&root, "greet"), ChecksumStatus::Unapproved);
-        approve_tool(&root, "greet").expect("approve");
-        assert_eq!(checksum_status(&root, "greet"), ChecksumStatus::Approved);
     }
 
     #[test]
@@ -935,7 +806,10 @@ mod tests {
     fn fence_stripping_preserves_python_indentation() {
         let reply = "```python\ndef main():\n    for i in range(3):\n\n        print(i)\n```\n";
         let stripped = strip_code_fences(reply);
-        assert_eq!(stripped, "def main():\n    for i in range(3):\n\n        print(i)");
+        assert_eq!(
+            stripped,
+            "def main():\n    for i in range(3):\n\n        print(i)"
+        );
     }
 
     #[test]
@@ -945,15 +819,26 @@ mod tests {
         assert_eq!(lang, ToolLang::Bash);
         assert_eq!(body, "#!/bin/bash\necho hi\n");
 
-        let (lang, body) = parse_generated_tool(
-            "```\n# LANG: python\nimport sys\n\nif True:\n    print(1)\n```",
-        )
-        .expect("decorated fenced reply");
+        let (lang, body) =
+            parse_generated_tool("```\n# LANG: python\nimport sys\n\nif True:\n    print(1)\n```")
+                .expect("decorated fenced reply");
         assert_eq!(lang, ToolLang::Python);
         assert_eq!(body, "import sys\n\nif True:\n    print(1)\n");
 
-        assert!(parse_generated_tool("echo hi\n").is_err(), "missing LANG line");
-        assert!(parse_generated_tool("LANG: ruby\nputs 1\n").is_err(), "unknown lang");
-        assert!(parse_generated_tool("LANG: bash\n\n").is_err(), "empty body");
+        assert!(
+            parse_generated_tool("echo hi\n").is_err(),
+            "missing LANG line"
+        );
+        assert!(
+            parse_generated_tool("LANG: ruby\nputs 1\n").is_err(),
+            "unknown lang"
+        );
+        assert!(
+            parse_generated_tool("LANG: bash\n\n").is_err(),
+            "empty body"
+        );
     }
 }
+
+#[cfg(test)]
+mod workflow_tests;

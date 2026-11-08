@@ -37,6 +37,32 @@ fn seed_approved_tool(home: &Path, name: &str, script: &str) -> PathBuf {
     dir
 }
 
+fn approve_tool_with_input(home: &Path, name: &str, input: &[u8]) -> std::process::Output {
+    use std::io::Write;
+    use std::os::unix::process::CommandExt;
+
+    let mut command = ask_command();
+    command
+        .args(["tool", "approve", name])
+        .env("HOME", home)
+        .env_remove("OPENROUTER_ASK_API_KEY")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Exercise the real confirmation reader without borrowing the runner's TTY.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().expect("start tool approval");
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    child.wait_with_output().expect("finish tool approval")
+}
+
 #[test]
 fn auto_toggle_persists_to_config_without_requiring_api_key() {
     // Point HOME at a scratch dir so the test never touches the real config.
@@ -44,7 +70,8 @@ fn auto_toggle_persists_to_config_without_requiring_api_key() {
         .duration_since(UNIX_EPOCH)
         .expect("system clock before unix epoch")
         .as_nanos();
-    let fake_home = std::env::temp_dir().join(format!("ask-auto-home-{}-{nonce}", std::process::id()));
+    let fake_home =
+        std::env::temp_dir().join(format!("ask-auto-home-{}-{nonce}", std::process::id()));
     std::fs::create_dir_all(&fake_home).expect("create fake home");
 
     let output = ask_command()
@@ -54,12 +81,18 @@ fn auto_toggle_persists_to_config_without_requiring_api_key() {
         .output()
         .expect("run ask auto on");
 
-    assert!(output.status.success(), "auto toggle must not need an API key");
+    assert!(
+        output.status.success(),
+        "auto toggle must not need an API key"
+    );
     assert!(String::from_utf8_lossy(&output.stdout).contains("Auto mode ON"));
 
     let config = std::fs::read_to_string(fake_home.join(".ask").join("config"))
         .expect("config file written");
-    assert!(config.contains("auto=on"), "config should persist auto: {config}");
+    assert!(
+        config.contains("auto=on"),
+        "config should persist auto: {config}"
+    );
 
     let output = ask_command()
         .args(["auto", "off"])
@@ -71,7 +104,10 @@ fn auto_toggle_persists_to_config_without_requiring_api_key() {
 
     let config = std::fs::read_to_string(fake_home.join(".ask").join("config"))
         .expect("config file written");
-    assert!(config.contains("auto=off"), "config should persist auto: {config}");
+    assert!(
+        config.contains("auto=off"),
+        "config should persist auto: {config}"
+    );
 
     let _ = std::fs::remove_dir_all(&fake_home);
 }
@@ -93,7 +129,10 @@ fn model_command_persists_shows_and_resets_without_api_key() {
         .env_remove("OPENROUTER_ASK_API_KEY")
         .output()
         .expect("run ask model <id>");
-    assert!(output.status.success(), "model set must not need an API key");
+    assert!(
+        output.status.success(),
+        "model set must not need an API key"
+    );
     assert!(String::from_utf8_lossy(&output.stdout).contains("saved as the default"));
 
     let config = std::fs::read_to_string(fake_home.join(".ask").join("config"))
@@ -316,6 +355,86 @@ fn a_prompt_requires_the_api_key() {
 }
 
 #[test]
+fn theme_persistence_waits_for_parsing_and_keeps_the_saved_model_and_auto() {
+    let home = fake_home("theme-precedence");
+    let config = home.join(".ask/config");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    let original = "theme=dark\nmodel=vendor/saved\nauto=on\nunknown=keep until save\n";
+    std::fs::write(&config, original).unwrap();
+
+    for (args, success) in [
+        (vec!["--theme", "light", "--help"], true),
+        (vec!["--theme", "light", "--model"], false),
+        (vec!["--theme", "light", "--theme", "invalid"], false),
+    ] {
+        let output = ask_command()
+            .args(&args)
+            .env("HOME", &home)
+            .env_remove("OPENROUTER_ASK_API_KEY")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.success(), success, "{args:?}");
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
+    }
+
+    let output = ask_command()
+        .args(["--theme", "light", "--model", "vendor/session", "request"])
+        .env("HOME", &home)
+        .env_remove("OPENROUTER_ASK_API_KEY")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("OPENROUTER_ASK_API_KEY"));
+    let saved = "theme=light\nmodel=vendor/saved\nauto=on\n";
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), saved);
+
+    let output = ask_command()
+        .args(["--model", "vendor/session", "model"])
+        .env("HOME", &home)
+        .env_remove("OPENROUTER_ASK_API_KEY")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        output.stdout,
+        b"\x1b[35mModel: vendor/session (current session override)\x1b[0m\n"
+    );
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), saved);
+    std::fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn theme_save_failures_warn_and_keep_the_override_active() {
+    let home = fake_home("theme-save-failure");
+    let config = home.join(".ask/config");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join("sentinel"), "keep").unwrap();
+    for missing_home in [false, true] {
+        let mut command = ask_command();
+        command
+            .args(["--theme", "light", "model"])
+            .env_remove("OPENROUTER_ASK_API_KEY");
+        if missing_home {
+            command.env_remove("HOME");
+        } else {
+            command.env("HOME", &home);
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success());
+        assert!(output.stdout.starts_with(b"\x1b[35mModel: "));
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .starts_with("Warning: could not save theme preference:")
+        );
+        assert_eq!(
+            std::fs::read_to_string(config.join("sentinel")).unwrap(),
+            "keep"
+        );
+    }
+    std::fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
 fn tool_list_works_keyless_and_hints_at_creation_when_empty() {
     let home = fake_home("tool-empty");
 
@@ -326,7 +445,10 @@ fn tool_list_works_keyless_and_hints_at_creation_when_empty() {
         .output()
         .expect("run ask tool list");
 
-    assert!(output.status.success(), "tool list must not need an API key");
+    assert!(
+        output.status.success(),
+        "tool list must not need an API key"
+    );
     assert!(String::from_utf8_lossy(&output.stdout).contains("tool new"));
 
     let _ = std::fs::remove_dir_all(&home);
@@ -354,7 +476,10 @@ fn approved_tool_lists_shows_and_runs_without_an_api_key() {
         .expect("run ask tool show");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("echo hello-from-tool"), "show prints source: {stdout}");
+    assert!(
+        stdout.contains("echo hello-from-tool"),
+        "show prints source: {stdout}"
+    );
     assert!(stdout.contains("approved"));
 
     let output = ask_command()
@@ -607,11 +732,30 @@ fn tampered_tool_refuses_to_run_until_reapproved_and_rm_deletes_it() {
         .expect("run ask '$hello'");
     assert!(!output.status.success(), "tampered tool must not run");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("tool approve"), "error should guide re-approval: {stderr}");
+    assert!(
+        stderr.contains("tool approve"),
+        "error should guide re-approval: {stderr}"
+    );
     assert!(
         !String::from_utf8_lossy(&output.stdout).contains("tampered"),
         "the tampered script must not have executed"
     );
+
+    let output = approve_tool_with_input(&home, "hello", b"YES\n");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Approved. Run it with: $hello"));
+    let output = ask_command()
+        .arg("$hello")
+        .env("HOME", &home)
+        .env_remove("OPENROUTER_ASK_API_KEY")
+        .output()
+        .expect("run reapproved tool");
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("tampered\n"));
 
     let output = ask_command()
         .args(["tool", "rm", "hello"])
@@ -623,6 +767,40 @@ fn tampered_tool_refuses_to_run_until_reapproved_and_rm_deletes_it() {
     assert!(!dir.exists(), "tool rm should delete the directory");
 
     let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn tool_approval_decline_and_eof_never_change_the_manifest_or_authorize_execution() {
+    let home = fake_home("tool-approval-input");
+    let dir = seed_approved_tool(&home, "hello", "echo must-not-run\n");
+    let manifest = "description=needs review\nlang=bash\n";
+    std::fs::write(dir.join("manifest"), manifest).unwrap();
+
+    for input in [b"\n".as_slice(), b"maybe\n", b"n\n", b""] {
+        let output = approve_tool_with_input(&home, "hello", input);
+        assert_eq!(output.status.success(), !input.is_empty());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(!stdout.contains("Approved. Run it with:"));
+        if !input.is_empty() {
+            assert!(stdout.contains("Not approved."));
+        } else {
+            assert!(String::from_utf8_lossy(&output.stderr).contains("No confirmation received"));
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.join("manifest")).unwrap(),
+            manifest
+        );
+        let output = ask_command()
+            .arg("$hello")
+            .env("HOME", &home)
+            .env_remove("OPENROUTER_ASK_API_KEY")
+            .output()
+            .expect("attempt unapproved tool");
+        assert!(!output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("must-not-run"));
+    }
+
+    std::fs::remove_dir_all(home).unwrap();
 }
 
 #[test]
@@ -667,7 +845,10 @@ fn tool_names_with_path_traversal_are_rejected() {
         .output()
         .expect("run ask tool rm ..");
     assert!(!output.status.success());
-    assert!(home.join("sentinel").exists(), "nothing outside tools/ may be touched");
+    assert!(
+        home.join("sentinel").exists(),
+        "nothing outside tools/ may be touched"
+    );
 
     let _ = std::fs::remove_dir_all(&home);
 }

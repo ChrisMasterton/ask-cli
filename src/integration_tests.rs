@@ -1,4 +1,9 @@
-use super::*;
+use crate::config::{Config, DEFAULT_MODEL};
+use crate::conversation::ConversationContext;
+use crate::execution::CommandOutcome;
+use crate::prompt::query_api;
+use std::env;
+use std::process::Command;
 use std::time::Instant;
 
 fn command_lines(commands: &[String]) -> Vec<&str> {
@@ -254,8 +259,8 @@ fn polite_question_form_still_returns_an_action() {
 #[ignore]
 fn terse_action_request_returns_a_command() {
     let (model, api_key, _t) = test_setup("terse_action");
-    let commands = query_api("files, detailed view", &model, &api_key, &[], None)
-        .expect("API call failed");
+    let commands =
+        query_api("files, detailed view", &model, &api_key, &[], None).expect("API call failed");
     assert_has_command(&commands);
     assert!(
         commands.join(" ").to_lowercase().contains("ls"),

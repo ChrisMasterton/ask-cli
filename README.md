@@ -158,13 +158,18 @@ destructive flags goes through review instead. Handy extras:
 | `model [MODEL]` | Show or switch the LLM (`model reset` for the default) |
 | `tool ...`, `$NAME args` | Tool library management and execution |
 
-The session keeps conversation history as LLM context (auto-compacted as it
-grows), including answers, command outcomes, and visible terminal output.
+The session retains answers, command outcomes, and visible terminal output,
+and selects recent whole interactions as context for each LLM request.
 If a command fails, the next prompt includes its error and any earlier
 successful steps. Skipped, cancelled, and unrun commands are recorded as such.
 Long output is trimmed from the beginning to retain final diagnostics; terminal
 capture stays in memory. The model can also answer questions conversationally —
 replies prefixed with `#` are commentary, not commands.
+
+Context selection does not prune stored history. `clear` resets conversation
+context while keeping readline history, the selected model, auto mode, and the
+working directory. See [token management](demo_token_limits.md) for the current
+selection and output limits.
 
 ## Configuration
 
@@ -178,6 +183,10 @@ Preferences live in `~/.ask/config` (simple `key=value`):
 
 `--model` overrides for a single run without persisting. The built-in default
 model is `meta-llama/llama-3.3-70b-instruct`.
+
+`--theme` applies to the current run and saves the theme preference. Help and
+argument errors leave saved preferences unchanged. If the theme cannot be saved,
+Ask warns and continues with the selected theme.
 
 ## Development
 

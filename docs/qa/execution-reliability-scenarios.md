@@ -70,4 +70,4 @@
 - Negative assertion: Ask does not silently claim that parent-shell-only state persisted
 - Suggested seam: One-shot CLI integration test plus manual shell verification
 
-Biggest blind spot: the `/dev/tty` confirmation and inherited-terminal path is manually proven but not yet automated in CI with a pseudo-terminal.
+Automated coverage includes PTY command I/O, concurrent output streaming, terminal stdin with redirected output, reported directory changes after nonzero exits, and early shell exits without a directory report. Fresh `/dev/tty` confirmation after rustyline remains a manual QA scenario; confirmation EOF and saved-tool approval through redirected stdin are covered separately.

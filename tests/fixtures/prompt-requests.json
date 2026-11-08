@@ -1,0 +1,51 @@
+[
+  {
+    "name": "plain",
+    "prompt": "create and enter a directory",
+    "catalog": "",
+    "piped_data": null,
+    "model": "fixture/model",
+    "sha256": "8f186e89e43763082c87df42aafa762bd1744c23d054b9258199601e60faefc7"
+  },
+  {
+    "name": "catalog_literals",
+    "prompt": "Explain {piped_data}, {tool_catalog}, and {query}",
+    "catalog": "**User tool library** — reusable scripts this user has saved:\n- $render — Fill in the {query} placeholder\nTo run one, output a line of exactly the form `$name args` (the `$` sigil plus the tool name — no interpreter, no path). Only reference tools from this list, and treat `$name` lines as executable commands, not commentary.\n",
+    "piped_data": null,
+    "model": "fixture/model",
+    "sha256": "382c2c61fe0527e1d9232bfd52b77fb5a96786c229bb5d470bac5693bf12f436"
+  },
+  {
+    "name": "piped_literals",
+    "prompt": "Explain {piped_data}, {tool_catalog}, and {query}",
+    "catalog": "**User tool library** — reusable scripts this user has saved:\n- $render — Fill in the {query} placeholder\nTo run one, output a line of exactly the form `$name args` (the `$` sigil plus the tool name — no interpreter, no path). Only reference tools from this list, and treat `$name` lines as executable commands, not commentary.\n",
+    "piped_data": "{\"query\":\"{query}\",\"template\":\"{piped_data}\"}",
+    "model": "fixture/model",
+    "sha256": "ea5827f079de00d1dd10d7513ef7400ecd4385e61ebbc01b2ba1fa7cbb5def40"
+  },
+  {
+    "name": "unicode_pipe_limit",
+    "prompt": "summarize",
+    "catalog": "**User tool library** — reusable scripts this user has saved:\n- $render — Fill in the {query} placeholder\nTo run one, output a line of exactly the form `$name args` (the `$` sigil plus the tool name — no interpreter, no path). Only reference tools from this list, and treat `$name` lines as executable commands, not commentary.\n",
+    "piped_repeat": {
+      "text": "🚀",
+      "count": 16385
+    },
+    "model": "fixture/model",
+    "sha256": "7639cb8ab822006de6c9fb4ceeae6e61a71a69558bc874d0cd427cd20c4d43bd"
+  },
+  {
+    "name": "conversation",
+    "prompt": "question two",
+    "model": "meta-llama/llama-3.3-70b-instruct",
+    "catalog": "",
+    "piped_data": null,
+    "history": [
+      {
+        "prompt": "question one",
+        "comment": "# fixture answer"
+      }
+    ],
+    "sha256": "1f796d9a05d21adcf242d59036d10e540637eabb208cda079a6fb6a31a4d690b"
+  }
+]
