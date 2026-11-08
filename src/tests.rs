@@ -973,6 +973,17 @@ fn tool_invocations_and_shell_expansions_require_confirmation() {
 }
 
 #[test]
+fn generated_tool_invocations_reject_shell_tails_at_the_execution_entry_point() {
+    for tail in ["$(printf fixture)", "a; echo fixture", "one && two"] {
+        let error = run_line(&format!("$hello {tail}")).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("Refusing to run '$hello' with shell metacharacters in its arguments: {tail}")
+        );
+    }
+}
+
+#[test]
 fn auto_toggle_parses_only_exact_commands() {
     assert_eq!(parse_auto_toggle("auto on"), Some(true));
     assert_eq!(parse_auto_toggle("  AUTO OFF "), Some(false));

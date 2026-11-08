@@ -119,7 +119,7 @@ ask> how many directories do we have?
 
 ### Speed & Efficiency
 - **Instant execution**: No API call needed
-- **No confirmation**: Skip the [Y/n/s/i] prompt
+- **No confirmation**: Skip the [Y/n/s] prompt
 - **Natural workflow**: Type commands as you would in a normal shell
 
 ### Safety

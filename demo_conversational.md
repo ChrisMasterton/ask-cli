@@ -35,20 +35,20 @@ ask> let's create a new project
 mkdir my_project
 cd my_project
 
-run> mkdir my_project? [Y/n/s/i] y
-run> cd my_project? [Y/n/s/i] y
+run> mkdir my_project? [Y/n/s] y
+run> cd my_project? [Y/n/s] y
 
 ask> nice, what did we just do?
 # We just created a new directory called 'my_project' and navigated into it. The project folder is now ready for you to add files and structure.
 
 ask> add a readme
-run> touch README.md? [Y/n/s/i] y
+run> touch README.md? [Y/n/s] y
 ```
 
 ### Context-Aware Conversation
 ```
 ask> show me the current directory
-run> pwd? [Y/n/s/i] y
+run> pwd? [Y/n/s] y
 /Users/chris/Projects
 
 ask> is this where we should be working?
@@ -71,7 +71,7 @@ ask> is this where we should be working?
 ### Maintained Functionality
 - All command features still work the same
 - Confirmation prompts for safety
-- Skip/instruct options available
+- Confirmation supports running, skipping, or cancelling generated commands
 - Context tracking continues across both modes
 
 ## Technical Details

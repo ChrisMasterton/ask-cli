@@ -804,6 +804,32 @@ fn tool_approval_decline_and_eof_never_change_the_manifest_or_authorize_executio
 }
 
 #[test]
+fn saved_tool_execution_failure_still_returns_an_error_after_streaming_output() {
+    let home = fake_home("tool-execution-failure");
+    seed_approved_tool(
+        &home,
+        "fail",
+        "printf 'partial stdout\\n'\nprintf 'partial stderr\\n' >&2\nexit 7\n",
+    );
+    let output = ask_command()
+        .arg("$fail")
+        .env("HOME", &home)
+        .env("SHELL", "/bin/zsh")
+        .env_remove("OPENROUTER_ASK_API_KEY")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("run>"));
+    assert!(stdout.contains("partial stdout"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("partial stderr"));
+    assert!(stderr.contains("Error:"));
+    assert!(stderr.contains("Command exited with status exit status: 7"));
+    std::fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
 fn tool_new_requires_the_api_key() {
     let home = fake_home("tool-new-keyless");
 

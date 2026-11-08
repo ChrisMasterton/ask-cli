@@ -1,0 +1,228 @@
+[
+  {
+    "content": "LANG: bash\necho hi",
+    "expected": {
+      "body": "echo hi\n",
+      "lang": "bash"
+    },
+    "mode": "new",
+    "name": "new-plain-bash"
+  },
+  {
+    "content": "```\n##** LANG: python ***\nif True:\n    print('é 🚀')\n```",
+    "expected": {
+      "body": "if True:\n    print('é 🚀')\n",
+      "lang": "python"
+    },
+    "mode": "new",
+    "name": "new-decorated-fenced-python"
+  },
+  {
+    "content": "if True:\n    print('é 🚀')",
+    "expected": {
+      "error": "The model's reply did not start with `LANG: bash` or `LANG: python` — nothing saved."
+    },
+    "mode": "new",
+    "name": "new-raw-source-rejected"
+  },
+  {
+    "content": "LANG: ruby\necho hi",
+    "expected": {
+      "error": "The model's reply did not start with `LANG: bash` or `LANG: python` — nothing saved."
+    },
+    "mode": "new",
+    "name": "new-unsupported-language"
+  },
+  {
+    "content": "LANG: python\n",
+    "expected": {
+      "error": "The model returned no script body — nothing saved."
+    },
+    "mode": "new",
+    "name": "new-header-without-body"
+  },
+  {
+    "content": "```python\n\nLANG: bash\n\t \n\n```\n",
+    "expected": {
+      "error": "The model returned no script body — nothing saved."
+    },
+    "mode": "new",
+    "name": "new-whitespace-body"
+  },
+  {
+    "content": "```bash\nLANG: bash\necho hi",
+    "expected": {
+      "body": "echo hi\n",
+      "lang": "bash"
+    },
+    "mode": "new",
+    "name": "new-opening-fence-only"
+  },
+  {
+    "content": "LANG: bash\necho hi\n```suffix",
+    "expected": {
+      "body": "echo hi\n",
+      "lang": "bash"
+    },
+    "mode": "new",
+    "name": "new-closing-fence-only"
+  },
+  {
+    "content": "LANG: bash\n```python\nprint(1)\n```",
+    "expected": {
+      "body": "```python\nprint(1)\n",
+      "lang": "bash"
+    },
+    "mode": "new",
+    "name": "new-inner-body-fence-retained"
+  },
+  {
+    "content": "````\r\nLANG: bash\r\n\r\nfirst\r\n\tsecond\r\n\r\n````",
+    "expected": {
+      "body": "first\n\tsecond\n",
+      "lang": "bash"
+    },
+    "mode": "new",
+    "name": "new-mixed-line-endings"
+  },
+  {
+    "content": "# explanation\nLANG: bash\necho hi",
+    "expected": {
+      "error": "The model's reply did not start with `LANG: bash` or `LANG: python` — nothing saved."
+    },
+    "mode": "new",
+    "name": "new-comment-before-header-rejected"
+  },
+  {
+    "content": "\n\t \n\n\n\n",
+    "expected": {
+      "error": "The model's reply did not start with `LANG: bash` or `LANG: python` — nothing saved."
+    },
+    "mode": "new",
+    "name": "new-empty-reply"
+  },
+  {
+    "content": "\n\t \nlang: BASH\necho hi\n\n",
+    "expected": {
+      "body": "echo hi\n",
+      "lang": "bash"
+    },
+    "mode": "new",
+    "name": "new-case-insensitive-header"
+  },
+  {
+    "content": "```python\n\nif True:\n    print('é 🚀')\n\n```\n",
+    "expected": {
+      "body": "\nif True:\n    print('é 🚀')\n",
+      "lang": "python"
+    },
+    "mode": "improve-python",
+    "name": "improvement-fenced-raw-python"
+  },
+  {
+    "content": "```python\n\nLANG: python\nif True:\n    print('é 🚀')\n\n```\n",
+    "expected": {
+      "body": "if True:\n    print('é 🚀')\n",
+      "lang": "python"
+    },
+    "mode": "improve-python",
+    "name": "improvement-same-language-header"
+  },
+  {
+    "content": "```\nLANG: python\nif True:\n    print('é 🚀')\n```",
+    "expected": {
+      "error": "The model tried to switch 'hello' from bash to python — not applied."
+    },
+    "mode": "improve-bash",
+    "name": "improvement-complete-language-switch-rejected"
+  },
+  {
+    "content": "LANG: python\n",
+    "expected": {
+      "body": "LANG: python\n",
+      "lang": "bash"
+    },
+    "mode": "improve-bash",
+    "name": "improvement-foreign-header-only-falls-back"
+  },
+  {
+    "content": "LANG: bash\n",
+    "expected": {
+      "body": "LANG: bash\n",
+      "lang": "bash"
+    },
+    "mode": "improve-bash",
+    "name": "improvement-same-header-only-falls-back"
+  },
+  {
+    "content": "LANG: ruby\necho hi",
+    "expected": {
+      "body": "LANG: ruby\necho hi\n",
+      "lang": "bash"
+    },
+    "mode": "improve-bash",
+    "name": "improvement-unsupported-header-falls-back"
+  },
+  {
+    "content": "```\nLANG: python  # comment\nif True:\n    print('é 🚀')\n```",
+    "expected": {
+      "body": "LANG: python  # comment\nif True:\n    print('é 🚀')\n",
+      "lang": "python"
+    },
+    "mode": "improve-python",
+    "name": "improvement-header-with-comment-falls-back"
+  },
+  {
+    "content": "```python\n\nLANG: bash ** *\necho hi\n\n```\n",
+    "expected": {
+      "body": "\nLANG: bash ** *\necho hi\n",
+      "lang": "bash"
+    },
+    "mode": "improve-bash",
+    "name": "improvement-malformed-decoration-falls-back"
+  },
+  {
+    "content": "```python\n\n\n\n\n```\n",
+    "expected": {
+      "error": "The model returned no script body — nothing changed."
+    },
+    "mode": "improve-bash",
+    "name": "improvement-empty-fallback-rejected"
+  },
+  {
+    "content": "```python\n\n\n\n  indented\tvalue  \n\n\n\n```\n",
+    "expected": {
+      "body": "\n\n\n  indented\tvalue  \n\n\n",
+      "lang": "python"
+    },
+    "mode": "improve-python",
+    "name": "improvement-inner-blanks-and-indentation"
+  },
+  {
+    "content": "```python\n\nLANG: python\n\t \n\n```\n",
+    "expected": {
+      "body": "\nLANG: python\n\t \n",
+      "lang": "bash"
+    },
+    "mode": "improve-bash",
+    "name": "improvement-foreign-header-with-blank-body-falls-back"
+  },
+  {
+    "content": "\u0000",
+    "expected": {
+      "body": "\u0000\n",
+      "lang": "bash"
+    },
+    "mode": "improve-bash",
+    "name": "improvement-nul-source-retained"
+  },
+  {
+    "content": "```python\n\n\r\nfirst\r\n\tsecond\r\n\n\n```\n",
+    "expected": {
+      "body": "\n\nfirst\n\tsecond\n\n",
+      "lang": "python"
+    },
+    "mode": "improve-python",
+    "name": "improvement-raw-crlf-source"
+  }
+]

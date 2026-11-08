@@ -11,7 +11,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::Theme;
+mod decoding;
 mod integrity;
+pub(crate) mod invocation;
 mod workflow;
 
 use integrity::{ToolIntegrity, inspect_tool};
@@ -305,98 +307,6 @@ pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-/// Turns an approved `$name args` invocation into the shell line to run.
-/// Refuses anything that isn't checksum-approved; the args tail is passed
-/// through verbatim as shell text (the user typed it, or confirmed it).
-pub(crate) fn resolve_approved_tool(
-    root: &Path,
-    name: &str,
-    args_tail: &str,
-) -> Result<String, String> {
-    if !is_valid_tool_name(name) {
-        return Err(format!("Invalid tool name '{name}'."));
-    }
-    let manifest = inspect_tool(root, name)?.into_approved_manifest(name)?;
-    let script = script_path(root, name, manifest.lang);
-    let mut line = format!(
-        "{} {}",
-        manifest.lang.interpreter(),
-        shell_quote(&script.to_string_lossy())
-    );
-    let args_tail = args_tail.trim();
-    if !args_tail.is_empty() {
-        line.push(' ');
-        line.push_str(args_tail);
-    }
-    Ok(line)
-}
-
-/// Strips a leading/trailing ``` fence pair (and surrounding blank lines)
-/// while leaving the body byte-for-byte intact — unlike `parse_commands`,
-/// which trims every line and would destroy Python indentation.
-pub(crate) fn strip_code_fences(content: &str) -> String {
-    let mut lines: Vec<&str> = content.lines().collect();
-    while lines.first().is_some_and(|line| line.trim().is_empty()) {
-        lines.remove(0);
-    }
-    while lines.last().is_some_and(|line| line.trim().is_empty()) {
-        lines.pop();
-    }
-    if lines
-        .first()
-        .is_some_and(|line| line.trim().starts_with("```"))
-    {
-        lines.remove(0);
-    }
-    if lines
-        .last()
-        .is_some_and(|line| line.trim().starts_with("```"))
-    {
-        lines.pop();
-    }
-    lines.join("\n")
-}
-
-/// Parses a `tool new` reply: a first line `LANG: bash|python` (tolerating
-/// comment or bold decoration) followed by the verbatim script body.
-pub(crate) fn parse_generated_tool(content: &str) -> Result<(ToolLang, String), String> {
-    let stripped = strip_code_fences(content);
-    let mut lang = None;
-    let mut consumed = 0;
-    for line in stripped.lines() {
-        consumed += 1;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let candidate = trimmed.trim_start_matches(['#', '*']).trim_start();
-        if let Some(value) = candidate.to_lowercase().strip_prefix("lang:") {
-            lang = ToolLang::from_str(value.trim().trim_end_matches('*').trim_end());
-        }
-        break;
-    }
-    let lang = lang.ok_or_else(|| {
-        "The model's reply did not start with `LANG: bash` or `LANG: python` — nothing saved."
-            .to_string()
-    })?;
-    let body: Vec<&str> = stripped
-        .lines()
-        .skip(consumed)
-        .skip_while(|line| line.trim().is_empty())
-        .collect();
-    if body.is_empty() {
-        return Err("The model returned no script body — nothing saved.".to_string());
-    }
-    Ok((lang, ensure_trailing_newline(body.join("\n"))))
-}
-
-fn ensure_trailing_newline(mut body: String) -> String {
-    if !body.ends_with('\n') {
-        body.push('\n');
-    }
-    body
-}
-
 fn require_root() -> Result<PathBuf, String> {
     tools_root().ok_or_else(|| "HOME is not set; cannot locate ~/.ask/tools.".to_string())
 }
@@ -577,6 +487,22 @@ mod tests {
         fs::write(tool_dir(root, name).join(lang.script_file()), script).expect("write script");
     }
 
+    pub(super) fn prepared_command(
+        root: &Path,
+        name: &str,
+        args_tail: &str,
+    ) -> Result<String, String> {
+        invocation::invoke_with(
+            name,
+            args_tail,
+            invocation::InvocationOrigin::User,
+            || Ok(root.to_path_buf()),
+            |_| {},
+            |_| Ok(String::new()),
+        )
+        .map(|execution| execution.command)
+    }
+
     #[test]
     fn tool_names_reject_traversal_and_odd_characters() {
         for good in ["backup", "du2", "my-tool_2", "2nd", "a"] {
@@ -735,45 +661,45 @@ mod tests {
     }
 
     #[test]
-    fn resolve_refuses_everything_but_approved_tools() {
+    fn invocation_refuses_everything_but_approved_tools() {
         let (_guard, root) = unique_tools_root("resolve");
         seed_tool(&root, "greet", ToolLang::Python, "print('hi')\n", true);
 
-        let resolved = resolve_approved_tool(&root, "greet", "  a b  ").expect("resolve");
+        let resolved = prepared_command(&root, "greet", "  a b  ").expect("resolve");
         let script = tool_dir(&root, "greet").join("main.py");
         assert_eq!(
             resolved,
             format!("python3 '{}' a b", script.display()),
             "interpreter + quoted path + verbatim tail"
         );
-        let no_args = resolve_approved_tool(&root, "greet", "").expect("resolve without args");
+        let no_args = prepared_command(&root, "greet", "").expect("resolve without args");
         assert!(!no_args.ends_with(' '));
 
         seed_tool(&root, "pending", ToolLang::Bash, "echo hi\n", false);
-        let err = resolve_approved_tool(&root, "pending", "").unwrap_err();
+        let err = prepared_command(&root, "pending", "").unwrap_err();
         assert!(
             err.contains("tool approve"),
             "unapproved error should guide: {err}"
         );
 
         fs::write(tool_dir(&root, "greet").join("main.py"), "print('evil')\n").expect("tamper");
-        let err = resolve_approved_tool(&root, "greet", "").unwrap_err();
+        let err = prepared_command(&root, "greet", "").unwrap_err();
         assert!(
             err.contains("changed since"),
             "mismatch error should explain: {err}"
         );
 
-        assert!(resolve_approved_tool(&root, "nope", "").is_err());
-        assert!(resolve_approved_tool(&root, "../etc", "").is_err());
+        assert!(prepared_command(&root, "nope", "").is_err());
+        assert!(prepared_command(&root, "../etc", "").is_err());
     }
 
     #[test]
-    fn resolve_quotes_script_paths_containing_spaces() {
+    fn invocation_quotes_script_paths_containing_spaces() {
         let (_guard, base) = unique_tools_root("space");
         let root = base.join("with space");
         fs::create_dir_all(&root).expect("create spaced root");
         seed_tool(&root, "hi", ToolLang::Bash, "echo hi\n", true);
-        let resolved = resolve_approved_tool(&root, "hi", "").expect("resolve");
+        let resolved = prepared_command(&root, "hi", "").expect("resolve");
         let script = tool_dir(&root, "hi").join("main.sh");
         assert_eq!(resolved, format!("bash '{}'", script.display()));
     }
@@ -800,43 +726,6 @@ mod tests {
         assert!(!catalog.contains("$pending"), "unapproved tools stay out");
         assert!(catalog.contains("…"), "long descriptions are truncated");
         assert!(!catalog.contains(&"x".repeat(101)));
-    }
-
-    #[test]
-    fn fence_stripping_preserves_python_indentation() {
-        let reply = "```python\ndef main():\n    for i in range(3):\n\n        print(i)\n```\n";
-        let stripped = strip_code_fences(reply);
-        assert_eq!(
-            stripped,
-            "def main():\n    for i in range(3):\n\n        print(i)"
-        );
-    }
-
-    #[test]
-    fn generated_tool_parsing_handles_decoration_and_fences() {
-        let (lang, body) =
-            parse_generated_tool("LANG: bash\n#!/bin/bash\necho hi\n").expect("plain reply");
-        assert_eq!(lang, ToolLang::Bash);
-        assert_eq!(body, "#!/bin/bash\necho hi\n");
-
-        let (lang, body) =
-            parse_generated_tool("```\n# LANG: python\nimport sys\n\nif True:\n    print(1)\n```")
-                .expect("decorated fenced reply");
-        assert_eq!(lang, ToolLang::Python);
-        assert_eq!(body, "import sys\n\nif True:\n    print(1)\n");
-
-        assert!(
-            parse_generated_tool("echo hi\n").is_err(),
-            "missing LANG line"
-        );
-        assert!(
-            parse_generated_tool("LANG: ruby\nputs 1\n").is_err(),
-            "unknown lang"
-        );
-        assert!(
-            parse_generated_tool("LANG: bash\n\n").is_err(),
-            "empty body"
-        );
     }
 }
 

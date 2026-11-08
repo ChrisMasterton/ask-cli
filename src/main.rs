@@ -197,17 +197,13 @@ fn is_safe_direct_command(cmd: &str) -> bool {
 /// invocations to their approved script first. Ordinary lines run unchanged.
 fn run_line(command: &str) -> Result<String, Box<dyn std::error::Error>> {
     if let Some((name, args_tail)) = tools::parse_tool_invocation(command) {
-        // The approved checksum covers the script, not the arguments — don't
-        // let a model-written args tail smuggle extra shell along for the ride.
-        if contains_shell_metacharacters(&args_tail) {
-            return Err(format!(
-                "Refusing to run '${name}' with shell metacharacters in its arguments: {args_tail}"
-            )
-            .into());
-        }
-        let root = tools::tools_root().ok_or("HOME is not set; cannot locate ~/.ask/tools.")?;
-        let resolved = tools::resolve_approved_tool(&root, &name, &args_tail)?;
-        return run_command_with_output(&resolved);
+        return tools::invocation::invoke_tool(
+            &name,
+            &args_tail,
+            tools::invocation::InvocationOrigin::Model,
+            |_| {},
+        )?
+        .result;
     }
     run_command_with_output(command)
 }

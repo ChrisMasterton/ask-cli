@@ -31,13 +31,13 @@ $ ask
 Interactive mode. Commands: 'exit', 'clear', 'finder'
 
 ask> create a new project folder
-run> mkdir my-new-project? [Y/n/s/i] y
+run> mkdir my-new-project? [Y/n/s] y
 
 ask> go into it
-run> cd my-new-project? [Y/n/s/i] y
+run> cd my-new-project? [Y/n/s] y
 
 ask> create some files
-run> touch README.md main.py requirements.txt? [Y/n/s/i] y
+run> touch README.md main.py requirements.txt? [Y/n/s] y
 
 ask> finder
 Opened Finder at current directory
@@ -78,13 +78,13 @@ While the built-in command opens the current directory, you can always ask the L
 
 ```
 ask> open finder at the parent directory
-run> open ..? [Y/n/s/i] y
+run> open ..? [Y/n/s] y
 
 ask> open finder at my home folder
-run> open ~? [Y/n/s/i] y
+run> open ~? [Y/n/s] y
 
 ask> open finder at a specific path
-run> open /Applications? [Y/n/s/i] y
+run> open /Applications? [Y/n/s] y
 ```
 
 But having `finder` as a quick built-in command makes the most common case (current directory) instant and effortless!

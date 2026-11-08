@@ -22,16 +22,19 @@ Runtime modules:
 - `src/session.rs`: interactive session state machine, input dispatch, settings, and history-update effects
 - `src/conversation.rs`: retained conversation updates, outcome rendering, and context-selection state machine
 - `src/execution.rs`: command execution state machine, batch stop reasons, automatic execution availability, and outcome reports
-- `src/confirmation.rs`: confirmation state machine, command/tool approval policies, and terminal input
+- `src/confirmation.rs`: confirmation state machine and command/tool approval policies
+- `src/confirmation/input.rs`: confirmation input acquisition, controlling-terminal preference, and stdin fallback
 - `src/subprocess.rs`: subprocess preparation, spawning, waiting, and completion for shell commands and inherited-I/O utilities
 - `src/terminal_io.rs`: terminal/pipe selection, concurrent output capture, bounded retention, and terminal-control decoding
 - `src/working_directory.rs`: child-directory reports, parent navigation, and before/after directory observation
 - `src/safety.rs`: safety request/assessment data, confidence thresholds, and local eligibility policy
 - `src/safety/assessment.rs`: bounded provider assessment state machine
 - `src/safety/cache.rs`: policy-gated assessment/cache state machine and atomic cache-write state machine
-- `src/tools.rs`: saved-tool CLI routing, model-response parsing, manifest format, and invocation resolution
+- `src/tools.rs`: saved-tool CLI routing, authoring templates, and manifest format
+- `src/tools/decoding.rs`: generated-script decoding state machine for new tools and improvements
 - `src/tools/workflow.rs`: saved-tool creation/improvement/reapproval workflow and approval persistence
 - `src/tools/integrity.rs`: fresh integrity inspection shared by listing, the model catalog, and invocation
+- `src/tools/invocation.rs`: shared saved-tool invocation state machine and user/model argument policies
 
 ## Build & Run Commands
 
@@ -42,6 +45,28 @@ make install        # Build release and install to /usr/local/bin/ask
 make clean          # Clean build artifacts
 ```
 
+`Makefile` and `install.sh` delegate installation/removal to
+`scripts/install-lifecycle.sh`. The standalone script locates this shared owner
+relative to its own path and retains the caller's working directory and ignored
+arguments. Make retains `release` as a shared prerequisite, then enters the
+installation machine after the build; uninstall never builds.
+
+| ID | Owner | Transition contract |
+| --- | --- | --- |
+| OP-01: Install/upgrade/restore | `scripts/install-lifecycle.sh` | Standalone build (or Make release prerequisite) → announce → inspect installed file → optionally overwrite backup → copy release → set executable permissions → installed/failed. Removal enters announce → remove current binary → inspect backup → optionally restore → uninstalled/failed. |
+
+Installation retains `/usr/local/bin/ask`, one `/usr/local/bin/ask.backup`, the
+relative `target/release/ask` artifact, native `-f` file guards, and sudo for each
+copy/chmod/remove/move operation. Each upgrade overwrites the previous backup.
+Uninstall removes the current binary before looking for a regular-file backup;
+restoration renames/consumes that backup and retains its permissions. No rollback,
+locking, directory creation, or backup versioning is added. Command failures stop
+later operations by default and retain partial effects; standalone failures
+return the command status and Make applies its own failure reporting. Explicit
+Make `-i`/`--ignore-errors` retains the previous per-recipe continuations and
+ignored-error messages. The two entry points keep their existing messages,
+including Make's ordinary/silent command echoes.
+
 ## Testing
 
 ```bash
@@ -50,6 +75,13 @@ cargo test -- --ignored --show-output   # Run integration tests (requires OPENRO
 ```
 
 Opt-in tests in `src/integration_tests.rs` and the ignored safety evaluation make real OpenRouter calls and require `OPENROUTER_ASK_API_KEY`. Deterministic tests live in `src/tests.rs`, runtime module test sections, and `tests/cli.rs`.
+
+`tests/install.rs` exercises relocated copies of the real installation entry
+points with fake cargo/sudo commands and real filesystem operations in owned
+scratch directories. It verifies upgrade/restoration results, permissions,
+command ordering, failure boundaries, silent/dry-run/ignore-errors Make behavior,
+and ignored standalone arguments without building a release or changing the
+system install.
 
 ## Architecture
 
@@ -115,9 +147,12 @@ Subprocess and directory machines:
 | IO-01: Child output | `terminal_io.rs` | Inherit streams, drain a PTY, or drain stdout/stderr concurrently → join → return deferred capture results. Child wait errors precede capture errors; stdout errors precede stderr errors. |
 | IO-02: Stream retention | `terminal_io.rs` | Read → forward → flush → retain → read again or complete/failed. Interrupted reads retry; all bytes stream visibly while only the latest 64 KB per stream are retained. |
 | IO-03: Terminal decoding | `terminal_io.rs` | Text → escape → CSI/OSC/OSC-escape → text. PTY history strips control sequences and normalizes CR; incomplete sequences retain the existing discard behavior. |
+| IO-04: Confirmation input | `confirmation/input.rs` | Open controlling terminal → flush stale input → read terminal line → complete/EOF/failed. Any open error selects native stdin line reading; terminal read errors never select fallback. |
 | WD-01: Directory change | `working_directory.rs` | Read child report → compare with starting directory → apply if changed → clean up → complete. The `..` shortcut enters the same apply transition directly. Missing, blank, or unreadable reports are ignored. |
 
 Shell commands use a new shell each time, preserving state within a returned shell line and propagating only its reported directory back to Ask. Full terminal attachment selects `/usr/bin/script`; redirected output keeps terminal stdin when available, and nonterminal stdin is closed for shell commands. Utilities such as clear/open inherit all streams. Capture failures occur before directory synchronization; directory-change failures preserve the existing early return before report-file cleanup. One-shot prompts observe before/after directories and retain the calling-shell note on successful reports.
+
+Confirmation opens `/dev/tty` for each attempt, including retries, and flushes queued input on a best-effort basis before reading. Terminal input consumes CR or LF and retains the existing byte-to-character conversion; stdin uses native UTF-8 `read_line` behavior and retains its delimiters. EOF with no input fails; partial input at EOF completes normally. Read errors, including interrupted terminal reads, remain errors even after partial input and do not fall back to another source.
 
 Saved-tool machines:
 
@@ -126,8 +161,14 @@ Saved-tool machines:
 | ST-01: Authoring/review | `tools/workflow.rs` | Validate → generate (new/improve only) → review → write → record approval → complete. Decline discards; errors fail. Standalone approval enters review after loading source. |
 | ST-02: Approval persistence | `tools/workflow.rs` | Read current manifest/script (improve/reapprove) or use the created draft → hash language and source → save manifest → approved/failed. Only accepted reviews reach this machine. |
 | ST-03: Integrity inspection | `tools/integrity.rs` | Load manifest → read script → verify → approved/unapproved/mismatch/broken. Missing or invalid manifests fail inspection; readable metadata remains available when a script is broken. |
+| ST-04: Saved-tool invocation | `tools/invocation.rs` | Check origin/arguments → locate root → validate name → inspect current integrity → prepare shell invocation → optional caller preview → execute → complete, or reject before execution. |
+| ST-05: Generated-script decoding | `tools/decoding.rs` | Trim outer blank lines → remove edge fences → inspect header → collect body or select improvement fallback → ensure trailing LF → check language and improvement body → complete/failed. |
 
-Tool integrity is derived from the existing manifest and script on every inspection; it is not a second persisted status. All three workflows retain the current manifest format, explicit-yes review prompts, language/fence parsing, and separate script/manifest writes. A failure after a script write does not roll it back, and integrity checks determine whether it can run.
+Tool integrity is derived from the existing manifest and script on every inspection; it is not a second persisted status. Authoring and approval persistence retain the current manifest format, explicit-yes review prompts, language/fence parsing, and separate script/manifest writes. A failure after a script write does not roll it back, and integrity checks determine whether it can run.
+
+New-script decoding requires a supported `LANG:` header on the first nonblank line and a body after it. Existing case/comment/bold header tolerances remain supported. Improvement decoding first attempts that complete format; any header/body parse failure falls back to the stripped source in the saved language. This includes unknown or malformed headers and header-only replies. A language switch is rejected only after a complete header-and-body parse, and an empty improvement is rejected after fallback. Opening and closing edge fences are removed independently, once each; their annotations do not determine the script language. Line contents, indentation, internal blanks, existing `str::lines` normalization, and trailing-LF behavior are retained. Decoding errors stop authoring before review or writes.
+
+CLI, interactive, and generated saved-tool invocations use ST-04. User-written argument tails keep their shell interpretation; separate CLI argv values are quoted by the argument machine as before. Model-written tails reject shell metacharacters before even resolving HOME. Integrity is rechecked on every invocation. Preparation rejection skips the invocation preview and execution callbacks; a prepared invocation returns its resolved command plus its execution result, including failures. CLI and generated callers propagate errors with their existing reporting; interactive callers record resolved execution failures but do not record rejected invocations. Generated batches retain their original proposal preview/confirmation and outcome command, owned by the execution machine.
 
 Safety machines:
 

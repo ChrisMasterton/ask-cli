@@ -67,6 +67,12 @@ make install                # builds --release and copies to /usr/local/bin
 export OPENROUTER_ASK_API_KEY="your-key"   # add to ~/.zshrc to persist
 ```
 
+`./install.sh` provides the same installation operations with standalone build
+messages. Each installation overwrites `ask.backup` with the currently installed
+binary, if present. `make uninstall` removes the current binary and restores that
+backup when available, consuming the backup. By default, a failed operation stops
+the flow and leaves completed changes in place.
+
 ## Usage
 
 Three modes, detected automatically:

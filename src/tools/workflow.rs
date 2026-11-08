@@ -1,11 +1,11 @@
 //! Creation, improvement, and reapproval share review and persistence phases.
 //! Only an accepted review reaches script writes or checksum recording.
 
+use super::decoding::{DecodeMode, decode_script};
 use super::{
     TOOL_IMPROVE_TEMPLATE, TOOL_NEW_TEMPLATE, ToolLang, ToolManifest, call_llm_content,
-    ensure_trailing_newline, load_manifest, parse_generated_tool, print_source, require_api_key,
-    require_name, require_root, save_manifest, script_path, strip_code_fences, tool_checksum,
-    tool_dir,
+    load_manifest, print_source, require_api_key, require_name, require_root, save_manifest,
+    script_path, tool_checksum, tool_dir,
 };
 use crate::Theme;
 use crate::confirmation::confirm_tool_approval;
@@ -258,7 +258,7 @@ where
                 .replace("{name}", name)
                 .replace("{description}", &description);
             let content = generate(&format!("Asking the model to write '{name}'…"), prompt)?;
-            let (lang, body) = parse_generated_tool(&content)?;
+            let (lang, body) = decode_script(&content, DecodeMode::New)?;
             Ok(ToolDraft {
                 lang,
                 body,
@@ -276,22 +276,7 @@ where
                 .replace("{current_script}", &current)
                 .replace("{instructions}", &instructions);
             let content = generate(&format!("Asking the model to improve '{name}'…"), prompt)?;
-            // A same-language header is accepted even though the template omits it.
-            let body = match parse_generated_tool(&content) {
-                Ok((generated_lang, body)) if generated_lang == lang => body,
-                Ok((generated_lang, _)) => {
-                    return Err(format!(
-                        "The model tried to switch '{name}' from {} to {} — not applied.",
-                        lang.as_str(),
-                        generated_lang.as_str()
-                    )
-                    .into());
-                }
-                Err(_) => ensure_trailing_newline(strip_code_fences(&content)),
-            };
-            if body.trim().is_empty() {
-                return Err("The model returned no script body — nothing changed.".into());
-            }
+            let (lang, body) = decode_script(&content, DecodeMode::Improve { name, lang })?;
             Ok(ToolDraft {
                 lang,
                 body,

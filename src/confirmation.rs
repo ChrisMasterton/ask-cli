@@ -2,9 +2,10 @@
 //! with separate policies for their intentionally different defaults.
 
 use crate::Theme;
-use std::fs;
-use std::io::{self, Read, Write};
-use std::os::unix::io::AsRawFd;
+use std::io::{self, Write};
+
+mod input;
+use input::read_confirmation_line;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConfirmationDecision {
@@ -120,52 +121,6 @@ pub(crate) fn confirm_tool_approval(question: &str, theme: &Theme) -> io::Result
         || unreachable!("tool approval declines input other than explicit yes"),
     )
     .map(|decision| decision == ConfirmationDecision::Accept)
-}
-
-fn read_confirmation_line() -> io::Result<String> {
-    let mut input = String::new();
-
-    // Prefer the controlling TTY when stdin is redirected or line editing is active.
-    match fs::OpenOptions::new().read(true).open("/dev/tty") {
-        Ok(tty) => {
-            // Discard stale rustyline input so only a fresh response is consumed.
-            unsafe {
-                libc::tcflush(tty.as_raw_fd(), libc::TCIFLUSH);
-            }
-
-            // rustyline can leave ICRNL unset, so accept both CR and LF.
-            let mut reader = io::BufReader::new(tty);
-            let mut byte = [0u8; 1];
-            loop {
-                match reader.read(&mut byte) {
-                    Ok(0) if input.is_empty() => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "No confirmation received before input closed",
-                        ));
-                    }
-                    Ok(0) => break,
-                    Ok(_) => {
-                        if byte[0] == b'\n' || byte[0] == b'\r' {
-                            break;
-                        }
-                        input.push(byte[0] as char);
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-        }
-        Err(_) => {
-            if io::stdin().read_line(&mut input)? == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "No confirmation received before input closed",
-                ));
-            }
-        }
-    }
-
-    Ok(input)
 }
 
 fn normalize_confirmation_input(input: &str) -> String {

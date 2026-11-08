@@ -8,7 +8,6 @@ use crate::config::preferences::{
 };
 use crate::prompt::process_prompt;
 use crate::session::run_interactive_mode;
-use crate::subprocess::run_command_with_output;
 use crate::theme::Theme;
 use crate::{MAX_PIPE_BYTES, tools};
 use std::env;
@@ -193,15 +192,19 @@ impl StartupIo for SystemStartup {
                         apply_model_command(command, &theme, &args.model)?;
                     }
                     LocalCommand::SavedTool { name, args_tail } => {
-                        let root = tools::tools_root()
-                            .ok_or("HOME is not set; cannot locate ~/.ask/tools.")?;
-                        let resolved = tools::resolve_approved_tool(&root, &name, &args_tail)?;
-                        println!(
-                            "{} {}",
-                            theme.prompt_text("run>"),
-                            theme.command_text(&resolved)
-                        );
-                        run_command_with_output(&resolved)?;
+                        let execution = tools::invocation::invoke_tool(
+                            &name,
+                            &args_tail,
+                            tools::invocation::InvocationOrigin::User,
+                            |command| {
+                                println!(
+                                    "{} {}",
+                                    theme.prompt_text("run>"),
+                                    theme.command_text(command)
+                                )
+                            },
+                        )?;
+                        execution.result?;
                     }
                     LocalCommand::ManageTool(command) => {
                         tools::handle_tool_command(command, &args.model, &theme)?;

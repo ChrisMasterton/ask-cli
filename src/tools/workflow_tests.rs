@@ -1,4 +1,4 @@
-use super::tests::{seed_tool, unique_tools_root};
+use super::tests::{prepared_command, seed_tool, unique_tools_root};
 use super::workflow::run_tool_workflow_with;
 use super::*;
 use crate::ThemeMode;
@@ -42,7 +42,7 @@ fn accepted_creation_saves_reviewed_source_and_is_available_to_catalog_and_execu
     assert_eq!(inspection.manifest.lang, ToolLang::Python);
     assert!(catalog_block(&root).contains("$hello"));
     assert!(
-        resolve_approved_tool(&root, "hello", "one")
+        prepared_command(&root, "hello", "one")
             .unwrap()
             .starts_with("python3 ")
     );
@@ -249,6 +249,55 @@ fn empty_or_language_changing_improvements_never_reach_review_or_change_the_tool
 }
 
 #[test]
+fn improvement_parse_failures_keep_raw_source_through_review_and_approval() {
+    for content in [
+        "LANG: python\n",
+        "LANG: ruby\nputs 1\n",
+        "LANG: bash # comment\necho revised\n",
+    ] {
+        for accepted in [false, true] {
+            let (_guard, root) = unique_tools_root("improve-raw-fallback");
+            seed_tool(&root, "hello", ToolLang::Bash, "echo original\n", true);
+            let original = load_manifest(&root, "hello").unwrap();
+            let mut reviews = 0;
+            run_tool_workflow_with(
+                ToolWorkflowRequest::Improve {
+                    name: "hello".into(),
+                    instructions: "revise".into(),
+                },
+                &Theme::from_mode(ThemeMode::Dark),
+                || Ok(root.clone()),
+                |_, _| Ok(content.to_string()),
+                |question, _| {
+                    reviews += 1;
+                    assert_eq!(question, "Apply and approve this new version? [y/N]");
+                    assert_eq!(
+                        fs::read_to_string(script_path(&root, "hello", ToolLang::Bash)).unwrap(),
+                        "echo original\n"
+                    );
+                    Ok(accepted)
+                },
+            )
+            .unwrap();
+            assert_eq!(reviews, 1);
+            let inspection = inspect_tool(&root, "hello").unwrap();
+            assert_eq!(inspection.integrity, ToolIntegrity::Approved);
+            assert_eq!(inspection.manifest.lang, ToolLang::Bash);
+            assert_eq!(inspection.manifest.description, original.description);
+            let expected = if accepted { content } else { "echo original\n" };
+            assert_eq!(
+                fs::read_to_string(script_path(&root, "hello", ToolLang::Bash)).unwrap(),
+                expected
+            );
+            assert_eq!(
+                inspection.manifest.approved_sha256,
+                Some(tool_checksum(ToolLang::Bash, expected.as_bytes()))
+            );
+        }
+    }
+}
+
+#[test]
 fn reapproval_records_current_script_bytes_without_generation() {
     let (_guard, root) = unique_tools_root("reapprove-workflow");
     seed_tool(&root, "hello", ToolLang::Bash, "echo original\n", true);
@@ -313,7 +362,7 @@ fn partial_save_failures_leave_written_scripts_unexecutable() {
             fs::read_to_string(script_path(&root, "hello", ToolLang::Bash)).unwrap(),
             "echo revised\n"
         );
-        assert!(resolve_approved_tool(&root, "hello", "").is_err());
+        assert!(prepared_command(&root, "hello", "").is_err());
         assert!(!catalog_block(&root).contains("$hello"));
     }
 }

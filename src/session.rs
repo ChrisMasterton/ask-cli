@@ -423,11 +423,22 @@ where
             name,
             args_tail,
         } => {
-            let resolved = tools::tools_root()
-                .ok_or_else(|| "HOME is not set; cannot locate ~/.ask/tools.".to_string())
-                .and_then(|root| tools::resolve_approved_tool(&root, &name, &args_tail));
-            match resolved {
-                Ok(command) => record_direct_command(&input, &command, theme),
+            let execution = tools::invocation::invoke_tool(
+                &name,
+                &args_tail,
+                tools::invocation::InvocationOrigin::User,
+                |command| {
+                    println!(
+                        "{} {}",
+                        theme.prompt_text("run>"),
+                        theme.command_text(command)
+                    )
+                },
+            );
+            match execution {
+                Ok(execution) => {
+                    record_command_result(&input, &execution.command, execution.result)
+                }
                 Err(error) => {
                     eprintln!("{error}");
                     SessionEffect::Continue(NextPrompt::Immediate)
@@ -466,7 +477,15 @@ fn record_direct_command(input: &str, command: &str, theme: &Theme) -> SessionEf
         theme.prompt_text("run>"),
         theme.command_text(command)
     );
-    let outcome = CommandOutcome::from_result(command, run_command_with_output(command));
+    record_command_result(input, command, run_command_with_output(command))
+}
+
+fn record_command_result(
+    input: &str,
+    command: &str,
+    result: SessionResult<String>,
+) -> SessionEffect {
+    let outcome = CommandOutcome::from_result(command, result);
     outcome.print_failure();
     SessionEffect::record_command(input, outcome, NoticePolicy::CheckBudget)
 }

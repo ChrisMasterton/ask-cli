@@ -35,11 +35,11 @@ $ ask
 Interactive mode. Type 'exit' or 'quit' to exit.
 
 ask> show me the current directory
-Run command: pwd? [Y/n/s/i] y
+Run command: pwd? [Y/n/s] y
 /Users/chris/Projects/agent-tools/ask-cli
 
 ask> list files in detail
-Run command: ls -la? [Y/n/s/i] y
+Run command: ls -la? [Y/n/s] y
 total 48
 drwxr-xr-x  12 chris  staff   384 Jan 15 10:30 .
 drwxr-xr-x   5 chris  staff   160 Jan 15 09:00 ..
@@ -47,7 +47,7 @@ drwxr-xr-x   5 chris  staff   160 Jan 15 09:00 ..
 ...
 
 ask> create a test file
-Run command: touch test.txt? [Y/n/s/i] s
+Run command: touch test.txt? [Y/n/s] s
 Skipping command: touch test.txt
 
 ask> exit

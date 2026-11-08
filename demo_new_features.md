@@ -1,52 +1,28 @@
-# New Features: Skip and Instruct Options
+# Command confirmation
 
-## Overview
-The `ask` CLI now supports two additional options when confirming commands:
-- **Skip (s)**: Skip the current command and continue to the next one
-- **Instruct (i)**: Execute a custom command first, then return to the original question
+Generated commands ask for confirmation before execution unless eligible for
+automatic execution under the saved auto-mode setting.
 
-## Feature Details
+- **Enter, y, or yes** runs the command.
+- **n or no** cancels execution of the remaining commands. Interactive mode
+  returns to its prompt.
+- **s or skip** skips the current command and continues with the next one.
+  The prompt displays the skip option when there are multiple executable commands.
 
-### Skip Option (s)
-- When you press `s` or type `skip`, the current command is skipped
-- The application continues with the next command in the queue
-- Unlike pressing `n` (which exits the app), skip allows you to continue processing remaining commands
+For example:
 
-### Instruct Option (i)
-- When you press `i` or type `instruct`, you can enter a custom command
-- The custom command is executed first
-- After execution, you're asked again about the original command
-- This is useful for running preparatory commands (e.g., checking directory contents before deleting files)
-
-## Example Usage Scenarios
-
-### Scenario 1: Skipping Unnecessary Commands
-```
-Run command: ls -la? [Y/n/s/i] s
+```text
+run> ls -la?  [Y/n/s]  s
 Skipping command: ls -la
-Run command: echo "Hello World"? [Y/n/s/i] y
+run> echo "Hello World"?  [Y/n/s]  y
 Hello World
 ```
 
-### Scenario 2: Using Instruct to Prepare
-```
-Run command: rm file.txt? [Y/n/s/i] i
-Enter command: ls -la file.txt
--rw-r--r-- 1 user group 1024 Jan 1 12:00 file.txt
-Returning to original command:
-Run command: rm file.txt? [Y/n/s/i] y
-```
+Invalid command responses show a hint and ask again. Closing input without an
+answer fails confirmation; it does not count as pressing Enter. Cancellation,
+command failure, or confirmation failure stops later executable commands, while
+commentary from the response can still display.
 
-## Implementation Changes
-
-1. **New Enum**: `ConfirmResponse` replaces the boolean return
-   - `Yes`: Execute the command
-   - `No`: Cancel and exit
-   - `Skip`: Skip this command, continue to next
-   - `Instruct(String)`: Execute custom command first
-
-2. **Updated Prompt**: Changed from `[Y/n]` to `[Y/n/s/i]`
-
-3. **Flow Control**: Skip uses `continue` instead of `return Ok(())` to keep processing
-
-4. **Input Validation**: Invalid responses now show a helpful message and re-prompt
+Saved-tool approval uses a separate policy: only an explicit **y** or **yes**
+approves the reviewed source. Enter and other responses decline without retrying;
+EOF without input reports a confirmation error.
